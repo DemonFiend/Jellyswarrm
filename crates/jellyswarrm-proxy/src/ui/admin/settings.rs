@@ -25,6 +25,7 @@ pub struct SettingsFormTemplate {
     pub include_server_name_in_media: bool,
     pub auto_create_users_on_login: bool,
     pub merge_libraries: bool,
+    pub web_client_passthrough: bool,
     pub ui_route: String,
 }
 
@@ -50,6 +51,7 @@ pub async fn settings_form(State(state): State<AppState>) -> impl IntoResponse {
         include_server_name_in_media: cfg.include_server_name_in_media,
         auto_create_users_on_login: cfg.auto_create_users_on_login,
         merge_libraries: cfg.merge_libraries,
+        web_client_passthrough: cfg.web_client_passthrough,
         ui_route: state.get_ui_route().await,
     };
     match form.render() {
@@ -72,6 +74,8 @@ pub struct SaveForm {
     pub auto_create_users_on_login: bool,
     #[serde(default)]
     pub merge_libraries: bool,
+    #[serde(default)]
+    pub web_client_passthrough: bool,
 }
 
 pub async fn save_settings(
@@ -92,6 +96,7 @@ pub async fn save_settings(
         cfg.include_server_name_in_media = form.include_server_name_in_media;
         cfg.auto_create_users_on_login = form.auto_create_users_on_login;
         cfg.merge_libraries = form.merge_libraries;
+        cfg.web_client_passthrough = form.web_client_passthrough;
         if let Err(e) = save_config(&cfg) {
             error!("Save failed: {}", e);
         }

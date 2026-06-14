@@ -141,6 +141,10 @@ fn default_merge_libraries() -> bool {
     true
 }
 
+fn default_web_client_passthrough() -> bool {
+    false
+}
+
 mod base64_serde {
     use super::*;
     use serde::de::Error as DeError;
@@ -234,6 +238,11 @@ define_fallback_deserializer!(
     default_auto_create_users_on_login
 );
 define_fallback_deserializer!(deserialize_merge_libraries, bool, default_merge_libraries);
+define_fallback_deserializer!(
+    deserialize_web_client_passthrough,
+    bool,
+    default_web_client_passthrough
+);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PreconfiguredServer {
@@ -308,6 +317,17 @@ pub struct AppConfig {
         deserialize_with = "deserialize_merge_libraries"
     )]
     pub merge_libraries: bool,
+
+    /// When true, the proxy stops serving its own embedded web client and
+    /// redirects `/` to `/web/`, which is proxied to the primary upstream. This
+    /// lets clients load the upstream's web client (and any server-side
+    /// web-client plugins, e.g. MediaBar / Home Screen Sections / JellyTag)
+    /// while all API traffic and library merging still flow through the proxy.
+    #[serde(
+        default = "default_web_client_passthrough",
+        deserialize_with = "deserialize_web_client_passthrough"
+    )]
+    pub web_client_passthrough: bool,
 }
 
 impl fmt::Debug for AppConfig {

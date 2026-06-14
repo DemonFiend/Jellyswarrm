@@ -19,6 +19,9 @@
     <label>Merge Libraries Across Servers
       <input type="checkbox" role="switch" name="merge_libraries" value="true" {% if merge_libraries %}checked{% endif %}>
     </label>
+    <label>Use Upstream Web Client (loads the primary server's web client + its plugins, e.g. MediaBar / Home Screen Sections)
+      <input type="checkbox" role="switch" name="web_client_passthrough" value="true" {% if web_client_passthrough %}checked{% endif %}>
+    </label>
   </fieldset>
   <div style="display:flex; gap:.5rem;">
     <button type="submit">Save</button>

@@ -809,29 +809,44 @@ async fn index_handler(
 
     if servers.is_empty() {
         // No servers configured, redirect to UI management
-        Ok(Response::builder()
+        return Response::builder()
             .status(StatusCode::TEMPORARY_REDIRECT)
             .header("Location", "/ui")
             .body(Body::empty())
             .map_err(|e| {
                 error!("Failed to build redirect response: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
+            });
+    }
+
+    // When web-client passthrough is enabled, behave like a stock Jellyfin server
+    // and redirect the root to /web/. `/web/*` is proxied to the primary upstream,
+    // so clients (including JMP) load the upstream's web client — which carries any
+    // server-side web-client plugins (MediaBar, Home Screen Sections, JellyTag, …).
+    if state.config.read().await.web_client_passthrough {
+        return Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header("Location", "/web/")
+            .body(Body::empty())
+            .map_err(|e| {
+                error!("Failed to build web redirect response: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            });
+    }
+
+    // Otherwise serve the embedded web client.
+    if let Some(content) = Asset::get("index.html") {
+        Ok(Response::builder()
+            .header("Content-Type", "text/html")
+            .body(Body::from(content.data.into_owned()))
+            .map_err(|e| {
+                error!("Failed to build index response: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
             })?)
     } else {
-        // Servers exist, return the index.html page
-        if let Some(content) = Asset::get("index.html") {
-            Ok(Response::builder()
-                .header("Content-Type", "text/html")
-                .body(Body::from(content.data.into_owned()))
-                .map_err(|e| {
-                    error!("Failed to build index response: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?)
-        } else {
-            // Fallback if index.html is not found in assets
-            error!("index.html not found in static assets");
-            Err(StatusCode::NOT_FOUND)
-        }
+        // Fallback if index.html is not found in assets
+        error!("index.html not found in static assets");
+        Err(StatusCode::NOT_FOUND)
     }
 }
 
