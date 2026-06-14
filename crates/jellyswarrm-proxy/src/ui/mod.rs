@@ -137,23 +137,6 @@ pub fn ui_routes() -> axum::Router<AppState> {
         .route("/settings/form", get(admin::settings::settings_form))
         .route("/settings/save", post(admin::settings::save_settings))
         .route("/settings/reload", post(admin::settings::reload_config))
-        // Homepage Layout
-        .route(
-            "/homepage-layout",
-            get(admin::homepage_layout::homepage_layout_page),
-        )
-        .route(
-            "/homepage-layout/form",
-            get(admin::homepage_layout::homepage_layout_form),
-        )
-        .route(
-            "/homepage-layout/promote",
-            post(admin::homepage_layout::promote_default),
-        )
-        .route(
-            "/homepage-layout/clear",
-            post(admin::homepage_layout::clear_default),
-        )
         .route_layer(middleware::from_fn(require_admin));
 
     Router::new()

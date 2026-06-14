@@ -707,9 +707,6 @@ mod tests {
             user_authorization: Arc::new(UserAuthorizationService::new(pool.clone())),
             server_storage: Arc::new(ServerStorageService::new(pool.clone())),
             media_storage: Arc::new(MediaStorageService::new(pool.clone())),
-            display_preferences: Arc::new(
-                crate::display_preferences_service::DisplayPreferencesService::new(pool.clone()),
-            ),
             merged_library_service: Arc::new(
                 crate::merged_library_service::MergedLibraryService::new(pool),
             ),

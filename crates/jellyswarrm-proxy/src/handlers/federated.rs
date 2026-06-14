@@ -319,17 +319,6 @@ async fn get_items_from_all_servers_with_merged_libraries(
     state: &AppState,
     preprocessed: PreprocessedRequest,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // The user's saved library order (OrderedViews, virtual IDs), captured before
-    // `preprocessed` is partially moved below. None when the user hasn't set one.
-    let ordered_views: Option<Vec<String>> = match preprocessed.user.as_ref() {
-        Some(u) => state
-            .display_preferences
-            .get_ordered_views(&u.id)
-            .await
-            .unwrap_or(None),
-        None => None,
-    };
-
     let original_request = preprocessed.original_request;
     let sessions = preprocessed.sessions.ok_or(StatusCode::UNAUTHORIZED)?;
     if sessions.is_empty() {
@@ -510,25 +499,11 @@ async fn get_items_from_all_servers_with_merged_libraries(
         }
     }
 
-    // Honor the user's saved library order (OrderedViews) when present; fall back
-    // to alphabetical for any library not named in the saved order.
-    let order_index: std::collections::HashMap<&str, usize> = ordered_views
-        .as_ref()
-        .map(|ids| {
-            ids.iter()
-                .enumerate()
-                .map(|(i, id)| (id.as_str(), i))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Present libraries in a stable alphabetical order.
     library_items.sort_by(|a, b| {
-        let ra = order_index.get(a.id.as_str()).copied().unwrap_or(usize::MAX);
-        let rb = order_index.get(b.id.as_str()).copied().unwrap_or(usize::MAX);
-        ra.cmp(&rb).then_with(|| {
-            let left = a.name.as_deref().unwrap_or("");
-            let right = b.name.as_deref().unwrap_or("");
-            left.cmp(right)
-        })
+        let left = a.name.as_deref().unwrap_or("");
+        let right = b.name.as_deref().unwrap_or("");
+        left.cmp(right)
     });
 
     let mut final_items = library_items;

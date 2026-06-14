@@ -1,6 +1,5 @@
 pub(crate) mod branding;
 pub(crate) mod common;
-pub(crate) mod display_preferences;
 pub(crate) mod federated;
 pub(crate) mod items;
 pub(crate) mod livestreams;

@@ -26,11 +26,6 @@ RUN if [ ! -f "package.json" ]; then \
       git checkout FETCH_HEAD ; \
     fi
 
-# Apply Jellyswarrm build-time patches to the web client (non-fatal — the script
-# skips itself if the upstream source has moved on a future UI bump).
-COPY patches/patch-jellyfin-web.mjs /tmp/jellyswarrm/patch-jellyfin-web.mjs
-RUN node /tmp/jellyswarrm/patch-jellyfin-web.mjs || echo "jellyswarrm patch step skipped"
-
 # Install all dependencies (including dev deps needed for build)
 RUN --mount=type=cache,target=/root/.npm \
     npm install --engine-strict=false --ignore-scripts

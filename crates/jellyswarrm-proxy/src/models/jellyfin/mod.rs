@@ -191,27 +191,6 @@ pub struct User {
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
-#[skip_serializing_none]
-#[multi_case_struct(pascal, camel)]
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct UserConfiguration {
-    pub play_default_audio_track: bool,
-    pub subtitle_language_preference: String,
-    pub display_missing_episodes: bool,
-    pub grouped_folders: Vec<String>,
-    pub subtitle_mode: String,
-    pub display_collections_view: bool,
-    pub enable_local_password: bool,
-    pub ordered_views: Vec<String>,
-    pub latest_items_excludes: Vec<String>,
-    pub my_media_excludes: Vec<String>,
-    pub hide_played_in_latest: bool,
-    pub remember_audio_selections: bool,
-    pub remember_subtitle_selections: bool,
-    pub enable_next_episode_auto_play: bool,
-    pub cast_receiver_id: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncPlayUserAccessType {
     CreateAndJoinGroups,
