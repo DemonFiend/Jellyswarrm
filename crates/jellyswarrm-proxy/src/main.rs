@@ -676,9 +676,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Router::new()
                     .route("/{stream_id}/Trickplay/{*path}", get(proxy_handler))
                     .route("/{item_id}/stream", get(handlers::videos::get_stream))
-                    .route("/{item_id}/stream.mkv", get(handlers::videos::get_stream))
-                    .route("/{item_id}/stream.mp4", get(handlers::videos::get_stream))
-                    .route("/{item_id}/stream.mov", get(handlers::videos::get_stream))
+                    // Match every container (.avi/.mkv/.mp4/.mov/.ts/…) so static
+                    // direct-play streams reach get_stream. Without this, an
+                    // unlisted container (e.g. .avi) falls through to the
+                    // get_video_resource catch-all below, which can 404 a
+                    // sessionless static probe — JMP reads that as DirectPlayError
+                    // and transcodes. Mirrors the /Audio and /LiveStreamFiles routes.
+                    .route(
+                        "/{item_id}/stream.{container}",
+                        get(handlers::videos::get_stream),
+                    )
                     .route(
                         "/{stream_id}/{*path}",
                         get(handlers::videos::get_video_resource),
