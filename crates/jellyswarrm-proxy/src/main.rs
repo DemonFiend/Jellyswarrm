@@ -571,6 +571,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "/UserViews",
                 get(handlers::federated::get_items_from_all_servers),
             )
+            // Home Screen Sections plugin (IAmParadox27): each server runs its own
+            // copy and a section's data is a standard QueryResult<BaseItemDto>, so fan
+            // out to every server's section endpoint and merge for combined content.
+            // The Sections list + Meta stay on the catch-all (relayed from the primary).
+            .route(
+                "/HomeScreen/Section/{name}",
+                get(handlers::home_screen::get_home_screen_section),
+            )
             // System info routes
             .nest(
                 "/System",

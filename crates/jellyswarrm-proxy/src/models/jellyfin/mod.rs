@@ -264,9 +264,12 @@ impl Default for BrandingConfig {
 pub struct ItemsResponseWithCount {
     #[serde(rename = "Items")]
     pub items: Vec<MediaItem>,
-    #[serde(rename = "TotalRecordCount")]
+    // `default` so an upstream plugin response that omits these (e.g. a Home Screen
+    // section that returns only `Items`) still parses as a counted response instead
+    // of failing to deserialize — the federated merge recomputes the real totals anyway.
+    #[serde(rename = "TotalRecordCount", default)]
     pub total_record_count: i32,
-    #[serde(rename = "StartIndex")]
+    #[serde(rename = "StartIndex", default)]
     pub start_index: i32,
 }
 
