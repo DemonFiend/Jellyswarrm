@@ -1,6 +1,15 @@
 use serde_json::Value;
 use sqlx::SqlitePool;
 
+/// Sentinel "user" under which the admin-defined default Home layout is stored.
+/// A real virtual user id is a hex token, so this never collides with one.
+pub const DEFAULT_USER_ID: &str = "__default__";
+/// Sentinel client used for the default DisplayPreferences row (the default is
+/// client-agnostic — every device inherits the same layout).
+pub const DEFAULT_CLIENT: &str = "__default__";
+/// The DisplayPreferences id the Jellyfin web/JMP client uses for home layout.
+pub const USERSETTINGS_PREFS_ID: &str = "usersettings";
+
 /// Stores Home-screen customization on the proxy itself, keyed by the virtual
 /// user id, so it persists regardless of which upstream server answers a given
 /// request (see upstream issue #23). Two kinds of state:
@@ -96,21 +105,89 @@ impl DisplayPreferencesService {
         Ok(())
     }
 
-    /// The user's saved library order (`OrderedViews`, virtual library IDs), if any.
+    /// The user's saved library order (`OrderedViews`, virtual library IDs).
+    /// Falls back to the admin-defined default layout when the user hasn't set one.
     pub async fn get_ordered_views(
         &self,
         user_id: &str,
     ) -> Result<Option<Vec<String>>, sqlx::Error> {
-        let cfg = self.get_user_configuration(user_id).await?;
-        Ok(cfg.and_then(|c| {
-            c.get("OrderedViews")
-                .or_else(|| c.get("orderedViews"))
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
-                        .collect()
-                })
-        }))
+        if let Some(cfg) = self.get_user_configuration(user_id).await? {
+            if let Some(views) = extract_ordered_views(&cfg) {
+                if !views.is_empty() {
+                    return Ok(Some(views));
+                }
+            }
+        }
+        // Fall back to the admin default (but not when we ARE the default row).
+        if user_id != DEFAULT_USER_ID {
+            if let Some(cfg) = self.get_user_configuration(DEFAULT_USER_ID).await? {
+                return Ok(extract_ordered_views(&cfg).filter(|v| !v.is_empty()));
+            }
+        }
+        Ok(None)
     }
+
+    /// The admin default DisplayPreferences (home sections), if one is set.
+    pub async fn get_default_display_preferences(&self) -> Result<Option<Value>, sqlx::Error> {
+        self.get_display_preferences(DEFAULT_USER_ID, DEFAULT_CLIENT, USERSETTINGS_PREFS_ID)
+            .await
+    }
+
+    /// Copy a user's current Home layout (home sections + library order) into the
+    /// global default that un-customized users inherit on every device.
+    pub async fn promote_user_to_default(&self, user_id: &str) -> Result<bool, sqlx::Error> {
+        let prefs = self
+            .get_display_preferences(user_id, "emby", USERSETTINGS_PREFS_ID)
+            .await?;
+        let cfg = self.get_user_configuration(user_id).await?;
+
+        // Nothing to copy if the user has never customized their home.
+        if prefs.is_none() && cfg.is_none() {
+            return Ok(false);
+        }
+        if let Some(prefs) = prefs {
+            self.set_display_preferences(
+                DEFAULT_USER_ID,
+                DEFAULT_CLIENT,
+                USERSETTINGS_PREFS_ID,
+                &prefs,
+            )
+            .await?;
+        }
+        if let Some(cfg) = cfg {
+            self.set_user_configuration(DEFAULT_USER_ID, &cfg).await?;
+        }
+        Ok(true)
+    }
+
+    /// Whether an admin default layout is currently set.
+    pub async fn has_default(&self) -> Result<bool, sqlx::Error> {
+        Ok(self.get_default_display_preferences().await?.is_some()
+            || self.get_user_configuration(DEFAULT_USER_ID).await?.is_some())
+    }
+
+    /// Remove the global default layout.
+    pub async fn clear_default(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM display_preferences WHERE user_id = ?")
+            .bind(DEFAULT_USER_ID)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM user_configuration WHERE user_id = ?")
+            .bind(DEFAULT_USER_ID)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Extract `OrderedViews` (virtual library IDs) from a UserConfiguration JSON blob.
+fn extract_ordered_views(cfg: &Value) -> Option<Vec<String>> {
+    cfg.get("OrderedViews")
+        .or_else(|| cfg.get("orderedViews"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
 }

@@ -1,0 +1,47 @@
+<div id="homepage-layout-messages">
+  {% if !message.is_empty() %}
+  <div class="alert">{{ message }}</div>
+  {% endif %}
+</div>
+
+<article>
+  <p>
+    Arrange the Home screen exactly how you want it on any user's account — in the
+    Jellyfin app under <strong>Settings → Display</strong> (Home Sections and Order
+    Libraries) — then promote that user's layout to the default below. New users, and
+    anyone who hasn't customized their own Home, inherit it on every device. They can
+    still change it on their own device whenever they like.
+  </p>
+
+  <p>
+    Current status:
+    {% if has_default %}
+    <span class="badge success">A default layout is set</span>
+    {% else %}
+    <span class="badge secondary">No default set</span>
+    {% endif %}
+  </p>
+
+  <form hx-post="/{{ ui_route }}/homepage-layout/promote"
+        hx-target="#homepage-layout-form" hx-swap="innerHTML" hx-disabled-elt="this">
+    <div class="grid" style="--pico-grid-gap:1rem; align-items:end;">
+      <label>Use this user's current Home layout
+        <select name="user_id" required style="margin-bottom:0;">
+          <option value="" disabled selected>Select user</option>
+          {% for user in users %}
+          <option value="{{ user.id }}">{{ user.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit" style="margin-bottom:0;">Set as default</button>
+    </div>
+  </form>
+
+  {% if has_default %}
+  <form hx-post="/{{ ui_route }}/homepage-layout/clear"
+        hx-target="#homepage-layout-form" hx-swap="innerHTML"
+        hx-confirm="Clear the default Home layout for all users?" style="margin-top:.5rem;">
+    <button type="submit" class="outline">Clear default</button>
+  </form>
+  {% endif %}
+</article>

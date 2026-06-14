@@ -42,7 +42,24 @@ async fn process_user(
                 .extra
                 .insert("Configuration".to_string(), stored_cfg);
         }
-        Ok(None) => {}
+        Ok(None) => {
+            // No personal layout yet: overlay the admin default library order onto
+            // the upstream Configuration so the user starts from the default and can
+            // adjust it on their own device.
+            if let Ok(Some(default_views)) = state
+                .display_preferences
+                .get_ordered_views(crate::display_preferences_service::DEFAULT_USER_ID)
+                .await
+            {
+                if let Some(cfg) = server_user
+                    .extra
+                    .get_mut("Configuration")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    cfg.insert("OrderedViews".to_string(), serde_json::json!(default_views));
+                }
+            }
+        }
         Err(e) => error!("Failed to load stored user configuration: {}", e),
     }
 

@@ -76,8 +76,23 @@ pub async fn handle_get(
     {
         Ok(Some(data)) => Ok(Json(data)),
         Ok(None) => {
+            // Fall back to the admin-defined default Home layout (home sections), if
+            // one is set — so un-customized users inherit it on every device.
+            if prefs_id == crate::display_preferences_service::USERSETTINGS_PREFS_ID {
+                if let Ok(Some(mut def)) =
+                    state.display_preferences.get_default_display_preferences().await
+                {
+                    debug!(
+                        "Serving admin default DisplayPreferences to user {} client {}",
+                        user_id, client
+                    );
+                    def["Id"] = serde_json::Value::String(prefs_id.clone());
+                    def["Client"] = serde_json::Value::String(client.clone());
+                    return Ok(Json(def));
+                }
+            }
             debug!(
-                "No stored DisplayPreferences for user {} client {} id {}; returning default",
+                "No stored DisplayPreferences for user {} client {} id {}; returning generic default",
                 user_id, client, prefs_id
             );
             Ok(Json(default_display_preferences(&prefs_id, &client)))
