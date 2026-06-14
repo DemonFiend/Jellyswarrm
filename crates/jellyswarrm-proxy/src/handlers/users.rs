@@ -29,6 +29,23 @@ async fn process_user(
 
     server_user.server_id = state.config.read().await.server_id.clone();
 
+    // Overlay the user's proxy-stored Configuration (OrderedViews / home prefs) so
+    // library order and home customization persist instead of reflecting whichever
+    // upstream answered. Stored as a JSON blob under the flattened `extra` map.
+    match state
+        .display_preferences
+        .get_user_configuration(&user.id)
+        .await
+    {
+        Ok(Some(stored_cfg)) => {
+            server_user
+                .extra
+                .insert("Configuration".to_string(), stored_cfg);
+        }
+        Ok(None) => {}
+        Err(e) => error!("Failed to load stored user configuration: {}", e),
+    }
+
     Ok(server_user)
 }
 

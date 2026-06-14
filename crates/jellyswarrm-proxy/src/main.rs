@@ -27,6 +27,7 @@ use axum_login::{
 };
 
 mod config;
+mod display_preferences_service;
 mod encryption;
 mod extractors;
 mod federated_users;
@@ -48,6 +49,7 @@ mod user_authorization_service;
 
 use federated_users::FederatedUserService;
 use handlers::syncplay::SyncPlayService;
+use display_preferences_service::DisplayPreferencesService;
 use legacy_server_identity::canonicalize_legacy_server_identity;
 use media_storage_service::MediaStorageService;
 use merged_library_service::MergedLibraryService;
@@ -87,6 +89,7 @@ pub struct AppState {
     pub server_storage: Arc<ServerStorageService>,
     pub media_storage: Arc<MediaStorageService>,
     pub merged_library_service: Arc<MergedLibraryService>,
+    pub display_preferences: Arc<DisplayPreferencesService>,
     pub play_sessions: Arc<SessionStorage>,
     pub config: Arc<tokio::sync::RwLock<AppConfig>>,
     pub processors: Arc<ProxyProcessors>,
@@ -119,6 +122,7 @@ impl AppState {
             server_storage: data_context.server_storage,
             media_storage: data_context.media_storage,
             merged_library_service: data_context.merged_library_service,
+            display_preferences: data_context.display_preferences,
             play_sessions: data_context.play_sessions,
             config: data_context.config,
             processors: Arc::new(proxy_processors),
@@ -205,6 +209,7 @@ pub struct DataContext {
     pub server_storage: Arc<ServerStorageService>,
     pub media_storage: Arc<MediaStorageService>,
     pub merged_library_service: Arc<MergedLibraryService>,
+    pub display_preferences: Arc<DisplayPreferencesService>,
     pub play_sessions: Arc<SessionStorage>,
     pub config: Arc<tokio::sync::RwLock<AppConfig>>,
 }
@@ -374,6 +379,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let merged_library_service = MergedLibraryService::new(pool.clone());
 
+    let display_preferences = DisplayPreferencesService::new(pool.clone());
+
     if !loaded_config.preconfigured_servers.is_empty() {
         info!(
             "Adding {} preconfigured servers from config",
@@ -429,6 +436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_storage: Arc::new(server_storage.clone()),
         media_storage: Arc::new(media_storage.clone()),
         merged_library_service: Arc::new(merged_library_service),
+        display_preferences: Arc::new(display_preferences),
         play_sessions: Arc::new(SessionStorage::new()),
         config: Arc::new(tokio::sync::RwLock::new(loaded_config.clone())),
     };
@@ -565,7 +573,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .route(
                         "/{user_id}/Items/{item_id}/SpecialFeatures",
                         get(handlers::items::get_items_list),
+                    )
+                    .route(
+                        "/{user_id}/Configuration",
+                        post(handlers::display_preferences::handle_post_user_configuration),
                     ),
+            )
+            .route(
+                "/DisplayPreferences/{id}",
+                get(handlers::display_preferences::handle_get)
+                    .post(handlers::display_preferences::handle_set),
             )
             .route(
                 "/UserViews",
