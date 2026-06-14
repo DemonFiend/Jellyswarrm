@@ -849,14 +849,22 @@ async fn proxy_handler(
     let path = if path.is_empty() { "index.html" } else { path };
     let decoded_path = percent_decode_str(path).decode_utf8_lossy().to_string();
     if let Some(content) = Asset::get(&decoded_path) {
-        let mime = mime_guess::from_path(decoded_path).first_or_octet_stream();
-        return Response::builder()
-            .header("Content-Type", mime.as_ref())
-            .body(Body::from(content.data.into_owned()))
-            .map_err(|e| {
-                error!("Failed to build static asset response: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            });
+        // In web-client passthrough mode we delegate the entire client to the
+        // primary upstream so its patched, plugin-equipped jellyfin-web is served
+        // whole. Serving our own embedded build here would mix two jellyfin-web
+        // versions (and a stale service worker) into one page, which breaks the
+        // plugins' bundle patches (MediaBar / Home Screen Sections never init).
+        // So when passthrough is on, fall through and proxy these paths upstream.
+        if !state.config.read().await.web_client_passthrough {
+            let mime = mime_guess::from_path(decoded_path).first_or_octet_stream();
+            return Response::builder()
+                .header("Content-Type", mime.as_ref())
+                .body(Body::from(content.data.into_owned()))
+                .map_err(|e| {
+                    error!("Failed to build static asset response: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                });
+        }
     }
 
     let preprocessed = preprocess_request(req, &state).await.map_err(|e| {
