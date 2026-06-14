@@ -174,14 +174,9 @@ pub async fn get_video_resource(
                     .is_some()
                 {
                     let server = preprocessed.server;
-                    if !state
-                        .server_storage
-                        .server_status(server.id)
-                        .await
-                        .is_healthy()
-                    {
+                    if !state.server_storage.is_routable(server.id).await {
                         error!(
-                            "Server {} for video resource {} is not healthy",
+                            "Server {} for video resource {} is confirmed offline",
                             server.name, id
                         );
                         return Err(StatusCode::NOT_FOUND);
@@ -243,14 +238,9 @@ pub async fn get_video_resource(
         }
     };
 
-    if !state
-        .server_storage
-        .server_status(server.id)
-        .await
-        .is_healthy()
-    {
+    if !state.server_storage.is_routable(server.id).await {
         error!(
-            "Server {} for play session {} is not healthy",
+            "Server {} for play session {} is confirmed offline",
             server.name, play_session.session_id
         );
         return Err(StatusCode::NOT_FOUND);

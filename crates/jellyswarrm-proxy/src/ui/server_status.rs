@@ -51,6 +51,20 @@ pub async fn check_server_status(
                     }
                 }
             }
+            ServerHealthStatus::Unknown => {
+                let template = ServerStatusTemplate {
+                    error_message: Some("Status unknown (not yet checked)".to_string()),
+                    server_version: None,
+                };
+
+                match template.render() {
+                    Ok(html) => Html(html).into_response(),
+                    Err(e) => {
+                        error!("Failed to render status template: {}", e);
+                        (StatusCode::INTERNAL_SERVER_ERROR, "Template error").into_response()
+                    }
+                }
+            }
         },
         Ok(None) => (
             StatusCode::NOT_FOUND,

@@ -100,9 +100,18 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for ServerAdmin {
 pub enum ServerHealthStatus {
     /// Server is healthy
     Healthy(PublicSystemInfo),
-    /// Server is unhealthy with reason
+    /// Server is unhealthy with reason (confirmed after the hysteresis threshold)
     Unhealthy(String),
+    /// Server has not been probed yet, or a transient failure has not yet crossed
+    /// the hysteresis threshold. Treated as routable so users are not logged out
+    /// and videos are not 404'd during the startup window or a brief blip.
+    Unknown,
 }
+
+/// Number of consecutive failed health probes required before a server is
+/// downgraded to `Unhealthy` (and its user sessions/streams dropped). A single
+/// transient probe failure holds the last-known-good status instead.
+const HEALTH_FAILURE_THRESHOLD: u32 = 3;
 
 impl ServerHealthStatus {
     pub fn is_healthy(&self) -> bool {
@@ -114,6 +123,8 @@ impl ServerHealthStatus {
 pub struct ServerStorageService {
     pool: SqlitePool,
     health_status: Arc<RwLock<HashMap<ServerId, ServerHealthStatus>>>,
+    /// Consecutive failed-probe counts per server, used for health hysteresis.
+    consecutive_failures: Arc<RwLock<HashMap<ServerId, u32>>>,
     pub http_client: reqwest::Client,
     pub client_info: ClientInfo,
 }
@@ -133,6 +144,7 @@ impl ServerStorageService {
         Self {
             pool,
             health_status: Arc::new(RwLock::new(HashMap::new())),
+            consecutive_failures: Arc::new(RwLock::new(HashMap::new())),
             http_client,
             client_info: ClientInfo::default(),
         }
@@ -320,7 +332,7 @@ impl ServerStorageService {
             }
         };
 
-        let statuses: Vec<(ServerId, ServerHealthStatus)> =
+        let probes: Vec<(ServerId, Result<PublicSystemInfo, String>)> =
             futures_util::stream::iter(servers.into_iter().map(|server| {
                 let http_client = self.http_client.clone();
                 let client_info = self.client_info.clone();
@@ -333,16 +345,14 @@ impl ServerStorageService {
                         Ok(c) => c,
                         Err(e) => {
                             error!("Failed to create client for server {}: {}", server.name, e);
-                            return (server.id, ServerHealthStatus::Unhealthy(e.to_string()));
+                            return (server.id, Err(e.to_string()));
                         }
                     };
 
-                    let status = match client.get_public_system_info().await {
-                        Ok(info) => ServerHealthStatus::Healthy(info),
-                        Err(e) => ServerHealthStatus::Unhealthy(e.to_string()),
-                    };
-
-                    (server.id, status)
+                    match client.get_public_system_info().await {
+                        Ok(info) => (server.id, Ok(info)),
+                        Err(e) => (server.id, Err(e.to_string())),
+                    }
                 }
             }))
             .buffer_unordered(5)
@@ -350,18 +360,42 @@ impl ServerStorageService {
             .await;
 
         let mut lock = self.health_status.write().await;
-        for (server_id, status) in statuses {
-            if let Some(old_status) = lock.get(&server_id) {
-                if *old_status == status {
-                    continue; // No change
-                } else {
+        let mut failures = self.consecutive_failures.write().await;
+        for (server_id, result) in probes {
+            let new_status = match result {
+                Ok(info) => {
+                    failures.insert(server_id, 0);
+                    ServerHealthStatus::Healthy(info)
+                }
+                Err(e) => {
+                    let count = failures.entry(server_id).or_insert(0);
+                    *count += 1;
+                    if *count >= HEALTH_FAILURE_THRESHOLD {
+                        ServerHealthStatus::Unhealthy(e)
+                    } else {
+                        // Not enough consecutive failures yet: hold the last-known-good
+                        // status (stay Healthy if we were) rather than dropping sessions.
+                        match lock.get(&server_id) {
+                            Some(ServerHealthStatus::Healthy(info)) => {
+                                ServerHealthStatus::Healthy(info.clone())
+                            }
+                            _ => ServerHealthStatus::Unknown,
+                        }
+                    }
+                }
+            };
+
+            match lock.get(&server_id) {
+                Some(old_status) if *old_status == new_status => {} // No change
+                Some(old_status) => {
                     info!(
                         "Server ID {} health status changed: {:?} -> {:?}",
-                        server_id, old_status, status
+                        server_id, old_status, new_status
                     );
                 }
+                None => {}
             }
-            lock.insert(server_id, status);
+            lock.insert(server_id, new_status);
         }
     }
 
@@ -369,10 +403,22 @@ impl ServerStorageService {
         let health = self.health_status.read().await;
         health
             .get(&server_id)
-            .unwrap_or(&ServerHealthStatus::Unhealthy(
-                "Unknown Server Status".to_string(),
-            ))
-            .clone()
+            .cloned()
+            .unwrap_or(ServerHealthStatus::Unknown)
+    }
+
+    /// Whether sessions/streams on this server should still be honored.
+    ///
+    /// Only servers we have *confirmed* `Unhealthy` (past the hysteresis
+    /// threshold) are excluded. Not-yet-probed / `Unknown` servers stay routable
+    /// so a valid login is not turned into a forced re-login — and videos are not
+    /// 404'd — during the startup window or a brief health-probe blip.
+    pub async fn is_routable(&self, server_id: ServerId) -> bool {
+        let health = self.health_status.read().await;
+        !matches!(
+            health.get(&server_id),
+            Some(ServerHealthStatus::Unhealthy(_))
+        )
     }
 
     /// Get the best available server (highest priority, healthy, active)

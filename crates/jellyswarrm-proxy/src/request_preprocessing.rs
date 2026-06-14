@@ -284,16 +284,13 @@ pub async fn extract_request_infos(
             }
         }
 
-        // filter for online servers only
+        // Keep sessions for any server that isn't *confirmed* offline. Not-yet-probed
+        // or briefly-flapping servers stay routable so a valid login isn't turned into
+        // a forced re-login (see ServerStorageService::is_routable).
         let mut filtered_sessions: Vec<(AuthorizationSession, Server)> =
             Vec::with_capacity(sessions.len());
         for (session, server) in sessions {
-            if state
-                .server_storage
-                .server_status(server.id)
-                .await
-                .is_healthy()
-            {
+            if state.server_storage.is_routable(server.id).await {
                 filtered_sessions.push((session, server));
             }
         }
