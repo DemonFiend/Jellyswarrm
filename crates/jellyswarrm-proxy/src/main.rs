@@ -844,8 +844,14 @@ async fn index_handler(
 #[axum::debug_handler]
 async fn proxy_handler(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
 ) -> Result<Response<Body>, StatusCode> {
+    // SGTV's config.json advertises themes by GUID, but theme CSS lives at themes/<name>/theme.css.
+    // A client that picked a theme requests themes/<GUID>/theme.css, which 404s -> no base theme ->
+    // unreadable text. Remap any GUID theme id to the default 'dark' theme so the UI stays readable
+    // (the user's Custom CSS / ElegantFin overlay still applies on top). Fixes the main client and
+    // the admin dashboard, for every client, regardless of where the bad theme value is stored.
+    remap_guid_theme_request(&mut req);
     // check if a resource was requested
     let path = req.uri().path();
     debug!("Using generic processing for path: {}", path);
@@ -1066,6 +1072,44 @@ fn rewrite_upstream_origin_in_body(
     Some(text.replace(&upstream_origin, proxy_origin).into_bytes())
 }
 
+/// Rewrite a `themes/<32-hex-GUID>/theme.css` request to the default `dark` theme. SGTV's
+/// `config.json` advertises themes by GUID, but the CSS files live at `themes/<name>/theme.css`,
+/// so a GUID path always 404s and leaves the client with no base theme (unreadable text). A GUID
+/// can never match a real theme folder, so falling back to the default keeps the UI readable for
+/// every client without per-machine fixes.
+fn remap_guid_theme_request(req: &mut Request) {
+    let Some(new_path) = guid_theme_path_to_default(req.uri().path()) else {
+        return;
+    };
+    let new_target = match req.uri().query() {
+        Some(query) => format!("{new_path}?{query}"),
+        None => new_path,
+    };
+    if let Ok(uri) = new_target.parse::<axum::http::Uri>() {
+        debug!("Remapped GUID theme request to {}", uri.path());
+        *req.uri_mut() = uri;
+    }
+}
+
+/// If `path` ends in `themes/<32-hex-GUID>/theme.css`, return the same path with the GUID replaced
+/// by `dark`; otherwise `None` (named themes like `themes/dark/` and non-theme paths pass through).
+fn guid_theme_path_to_default(path: &str) -> Option<String> {
+    let marker = "/themes/";
+    let lower = path.to_ascii_lowercase();
+    let idx = lower.rfind(marker)?;
+    let after = &lower[idx + marker.len()..];
+    let (id, tail) = after.split_once('/')?;
+    if tail != "theme.css" {
+        return None;
+    }
+    if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let prefix = &path[..idx + marker.len()];
+        Some(format!("{prefix}dark/theme.css"))
+    } else {
+        None
+    }
+}
+
 async fn shutdown_signal(deletion_task_abort_handle: AbortHandle) {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -1174,5 +1218,21 @@ mod hostname_sealing_tests {
             headers.get(header::LOCATION).unwrap(),
             "https://elsewhere.example.com/foo"
         );
+    }
+
+    #[test]
+    fn guid_theme_path_remaps_to_default_dark() {
+        assert_eq!(
+            guid_theme_path_to_default("/web/themes/37ec67ae16b249139d042dbcfc9fa0e9/theme.css")
+                .as_deref(),
+            Some("/web/themes/dark/theme.css")
+        );
+    }
+
+    #[test]
+    fn named_or_non_theme_paths_pass_through() {
+        assert!(guid_theme_path_to_default("/web/themes/dark/theme.css").is_none());
+        assert!(guid_theme_path_to_default("/web/themes/blueradiance/theme.css").is_none());
+        assert!(guid_theme_path_to_default("/web/main.jellyfin.bundle.js").is_none());
     }
 }
