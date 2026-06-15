@@ -1078,15 +1078,26 @@ fn rewrite_upstream_origin_in_body(
 /// can never match a real theme folder, so falling back to the default keeps the UI readable for
 /// every client without per-machine fixes.
 fn remap_guid_theme_request(req: &mut Request) {
-    let Some(new_path) = guid_theme_path_to_default(req.uri().path()) else {
+    // `axum_to_reqwest` builds the upstream request from the `OriginalUri` extension, NOT
+    // `req.uri()` — so that's the URI we must rewrite. Changing `req.uri()` alone is silently
+    // ignored downstream (the original GUID path still reaches the upstream and 404s). Read the
+    // path from `OriginalUri` (falling back to `req.uri()`), and write the rewrite back to both.
+    let current = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|original| original.0.clone())
+        .unwrap_or_else(|| req.uri().clone());
+    let Some(new_path) = guid_theme_path_to_default(current.path()) else {
         return;
     };
-    let new_target = match req.uri().query() {
+    let new_target = match current.query() {
         Some(query) => format!("{new_path}?{query}"),
         None => new_path,
     };
     if let Ok(uri) = new_target.parse::<axum::http::Uri>() {
         debug!("Remapped GUID theme request to {}", uri.path());
+        req.extensions_mut()
+            .insert(axum::extract::OriginalUri(uri.clone()));
         *req.uri_mut() = uri;
     }
 }
@@ -1234,5 +1245,27 @@ mod hostname_sealing_tests {
         assert!(guid_theme_path_to_default("/web/themes/dark/theme.css").is_none());
         assert!(guid_theme_path_to_default("/web/themes/blueradiance/theme.css").is_none());
         assert!(guid_theme_path_to_default("/web/main.jellyfin.bundle.js").is_none());
+    }
+
+    #[test]
+    fn remap_rewrites_the_original_uri_extension() {
+        // axum_to_reqwest reads OriginalUri (not req.uri()) to build the upstream request, so the
+        // rewrite has to land on the OriginalUri extension or it never reaches the upstream.
+        let path = "/web/themes/37ec67ae16b249139d042dbcfc9fa0e9/theme.css";
+        let mut req = axum::http::Request::builder()
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::OriginalUri(path.parse().unwrap()));
+
+        remap_guid_theme_request(&mut req);
+
+        let original = req
+            .extensions()
+            .get::<axum::extract::OriginalUri>()
+            .expect("OriginalUri present");
+        assert_eq!(original.0.path(), "/web/themes/dark/theme.css");
+        assert_eq!(req.uri().path(), "/web/themes/dark/theme.css");
     }
 }
