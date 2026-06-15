@@ -912,6 +912,11 @@ async fn proxy_handler(
         );
     }
     let mut headers = response.headers().clone();
+    // #4 (hostname sealing): if the upstream hands back an absolute redirect to its own origin,
+    // rewrite it to a proxy-relative path so the client follows it back through the proxy
+    // instead of being handed the real server's hostname (which leaks the upstream and can
+    // strand / redirect the client onto it).
+    rewrite_location_to_relative(&mut headers, response_server.url.as_url());
     let mut body_bytes = response.bytes().await.map_err(|e| {
         error!("Failed to read response body: {}", e);
         StatusCode::BAD_GATEWAY
@@ -958,6 +963,22 @@ async fn proxy_handler(
         }
     }
 
+    // #4 (hostname sealing): strip the upstream origin out of textual bodies (e.g. plugin
+    // configs that embed absolute https://<upstream>/... URLs) so the client never sees the
+    // real server address. Rewrites to the proxy's public origin and refreshes Content-Length.
+    let public_address = state.config.read().await.public_address.clone();
+    if let Some(rewritten) =
+        rewrite_upstream_origin_in_body(&headers, &body_bytes, response_server.url.as_url(), &public_address)
+    {
+        debug!("Rewrote upstream origin out of response body for {}", request_url);
+        headers.remove(header::CONTENT_LENGTH);
+        headers.remove(header::TRANSFER_ENCODING);
+        if let Ok(len) = HeaderValue::from_str(&rewritten.len().to_string()) {
+            headers.insert(header::CONTENT_LENGTH, len);
+        }
+        body_bytes = rewritten.into();
+    }
+
     let mut response_builder = Response::builder().status(status);
 
     // Copy headers, filtering out hop-by-hop headers
@@ -980,6 +1001,69 @@ fn is_json_response(headers: &axum::http::HeaderMap) -> bool {
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|content_type| content_type.contains("application/json"))
+}
+
+/// Rewrite an absolute `Location` redirect that points at the upstream's own origin into a
+/// proxy-relative path, so the client follows the redirect through the proxy rather than being
+/// handed (and stranded on) the upstream hostname. Foreign-origin or already-relative redirects
+/// are left untouched.
+fn rewrite_location_to_relative(headers: &mut axum::http::HeaderMap, upstream: &url::Url) {
+    let Some(location) = headers.get(header::LOCATION).and_then(|v| v.to_str().ok()) else {
+        return;
+    };
+    let Ok(location_url) = url::Url::parse(location) else {
+        return; // already relative — nothing to leak
+    };
+    if location_url.origin() != upstream.origin() {
+        return;
+    }
+    let mut relative = location_url.path().to_string();
+    if let Some(query) = location_url.query() {
+        relative.push('?');
+        relative.push_str(query);
+    }
+    if let Ok(value) = HeaderValue::from_str(&relative) {
+        headers.insert(header::LOCATION, value);
+    }
+}
+
+/// Replace the upstream server's origin (`scheme://host[:port]`) with the proxy's public origin
+/// in a textual response body, so absolute upstream URLs don't leak to the client. Returns the
+/// rewritten bytes only when a replacement was actually made (so callers can skip re-framing the
+/// body otherwise).
+fn rewrite_upstream_origin_in_body(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+    upstream: &url::Url,
+    public_address: &str,
+) -> Option<Vec<u8>> {
+    if body.is_empty() {
+        return None;
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let is_textual = content_type.contains("json")
+        || content_type.contains("javascript")
+        || content_type.contains("xml")
+        || content_type.starts_with("text/");
+    if !is_textual {
+        return None;
+    }
+    let upstream_origin = upstream.origin().ascii_serialization();
+    if upstream_origin == "null" {
+        return None; // opaque origin (no host to leak)
+    }
+    let proxy_origin = public_address.trim_end_matches('/');
+    if upstream_origin == proxy_origin {
+        return None;
+    }
+    let text = std::str::from_utf8(body).ok()?;
+    if !text.contains(&upstream_origin) {
+        return None;
+    }
+    Some(text.replace(&upstream_origin, proxy_origin).into_bytes())
 }
 
 async fn shutdown_signal(deletion_task_abort_handle: AbortHandle) {
@@ -1008,5 +1092,87 @@ async fn shutdown_signal(deletion_task_abort_handle: AbortHandle) {
     tokio::select! {
         _ = ctrl_c => { deletion_task_abort_handle.abort() },
         _ = terminate => { deletion_task_abort_handle.abort() },
+    }
+}
+
+#[cfg(test)]
+mod hostname_sealing_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn headers_with_content_type(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(value));
+        headers
+    }
+
+    #[test]
+    fn body_rewrite_replaces_upstream_origin() {
+        let upstream = url::Url::parse("https://stream.example.com").unwrap();
+        let body = br#"{"u":"https://stream.example.com/MediaBar/x.js"}"#;
+        let out = rewrite_upstream_origin_in_body(
+            &headers_with_content_type("application/json"),
+            body,
+            &upstream,
+            "https://proxy.example.com/",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"{"u":"https://proxy.example.com/MediaBar/x.js"}"#
+        );
+    }
+
+    #[test]
+    fn body_rewrite_skips_when_origin_absent() {
+        let upstream = url::Url::parse("https://stream.example.com").unwrap();
+        let body = br#"{"u":"/relative/path"}"#;
+        assert!(rewrite_upstream_origin_in_body(
+            &headers_with_content_type("application/json"),
+            body,
+            &upstream,
+            "https://proxy.example.com",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn body_rewrite_skips_non_textual() {
+        let upstream = url::Url::parse("https://stream.example.com").unwrap();
+        let body = b"https://stream.example.com";
+        assert!(rewrite_upstream_origin_in_body(
+            &headers_with_content_type("image/png"),
+            body,
+            &upstream,
+            "https://proxy.example.com",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn location_rewrite_strips_upstream_origin_to_relative() {
+        let upstream = url::Url::parse("https://stream.example.com").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::LOCATION,
+            HeaderValue::from_static("https://stream.example.com/web/index.html?x=1"),
+        );
+        rewrite_location_to_relative(&mut headers, &upstream);
+        assert_eq!(headers.get(header::LOCATION).unwrap(), "/web/index.html?x=1");
+    }
+
+    #[test]
+    fn location_rewrite_leaves_foreign_origin_untouched() {
+        let upstream = url::Url::parse("https://stream.example.com").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::LOCATION,
+            HeaderValue::from_static("https://elsewhere.example.com/foo"),
+        );
+        rewrite_location_to_relative(&mut headers, &upstream);
+        assert_eq!(
+            headers.get(header::LOCATION).unwrap(),
+            "https://elsewhere.example.com/foo"
+        );
     }
 }

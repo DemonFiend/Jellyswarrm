@@ -68,18 +68,20 @@ pub async fn execute_json_request<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let response = client
-        .execute(request)
-        .await
-        .map_err(|e| {
-            error!("Failed to execute request: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?
-        .error_for_status()
-        .map_err(|e| {
-            error!("Request failed with status: {}", e);
-            StatusCode::UNAUTHORIZED
-        })?;
+    let response = client.execute(request).await.map_err(|e| {
+        error!("Failed to execute request: {}", e);
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        error!("Upstream request returned status: {}", status);
+        // Forward the upstream status faithfully instead of laundering every non-2xx into a
+        // 401. A real 401/403 still surfaces as auth-failure (a legitimate re-login), but a
+        // transient 5xx / 404 must NOT masquerade as "you're logged out" — that blanket
+        // mapping is what bounced clients to the login screen on every upstream hiccup.
+        return Err(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+    }
 
     let response_text = response.text().await.map_err(|e| {
         error!("Failed to get response text: {}", e);

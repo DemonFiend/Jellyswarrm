@@ -295,6 +295,30 @@ pub async fn extract_request_infos(
             }
         }
 
+        // FEDERATION COVERAGE: the device-filtered set above can omit a server the user is
+        // genuinely signed into when that server's session was created under a different device
+        // id (app reinstall, token refresh, a second client). The federated handlers fan out
+        // over exactly this list, so an omitted server silently vanishes from the merged view —
+        // and a request routed to it would go out tokenless and 401. Fill in one routable
+        // session for any server the device match missed, device-agnostically (the upstream
+        // accepts any of the user's valid tokens). Device-matched sessions stay first, so
+        // single-server resolution in `resolve_server` is unaffected.
+        let mut covered: std::collections::HashSet<_> =
+            filtered_sessions.iter().map(|(_, server)| server.id).collect();
+        let all_user_sessions = state
+            .user_authorization
+            .get_user_sessions(&user.id, None)
+            .await?;
+        for (session, server) in all_user_sessions {
+            if covered.contains(&server.id) {
+                continue;
+            }
+            if state.server_storage.is_routable(server.id).await {
+                covered.insert(server.id);
+                filtered_sessions.push((session, server));
+            }
+        }
+
         if !filtered_sessions.is_empty() {
             Some(filtered_sessions)
         } else {
