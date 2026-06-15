@@ -4,7 +4,7 @@ use axum::{
     Json,
 };
 use hyper::StatusCode;
-use tracing::error;
+use tracing::warn;
 
 use crate::{
     extractors::RequireUser, handlers::common::execute_json_request, ui::JELLYFIN_UI_VERSION,
@@ -76,6 +76,18 @@ pub async fn info(
     headers: HeaderMap,
     RequireUser { preprocessed, .. }: RequireUser,
 ) -> Result<Json<crate::models::ServerInfo>, StatusCode> {
+    // Snapshot the config-owned identity up front so we never hold the config lock across
+    // the upstream round-trip, and can still answer if that round-trip fails.
+    let (server_id, server_name, public_address) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.server_id.clone(),
+            cfg.server_name.clone(),
+            cfg.public_address.clone(),
+        )
+    };
+    let local_address = forwarded_public_url(&headers).unwrap_or(public_address);
+
     match execute_json_request::<crate::models::ServerInfo>(
         &state.reqwest_client,
         preprocessed.request,
@@ -83,17 +95,54 @@ pub async fn info(
     .await
     {
         Ok(mut server_info) => {
-            let cfg = state.config.read().await;
-            server_info.id = cfg.server_id.clone();
-            server_info.server_name = cfg.server_name.clone();
-            server_info.local_address =
-                forwarded_public_url(&headers).unwrap_or_else(|| cfg.public_address.clone());
-
+            server_info.id = server_id;
+            server_info.server_name = server_name;
+            server_info.local_address = local_address;
             Ok(Json(server_info))
         }
+        // `/System/Info` is the client's "am I still signed in?" probe on every reconnect /
+        // app-foreground; failing it drops the client to the login screen. The identity fields
+        // here are config-owned anyway, so a flaky, slow, or token-less upstream round-trip must
+        // not be fatal — answer locally with a 200 instead.
         Err(e) => {
-            error!("Failed to get server info: {:?}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            warn!("Upstream /System/Info failed ({e:?}); serving config-derived server info");
+            Ok(Json(local_server_info(server_id, server_name, local_address)))
         }
+    }
+}
+
+/// A fully-local `ServerInfo` built from proxy config, used when the upstream round-trip
+/// fails so `/System/Info` can never force the client to re-login.
+fn local_server_info(
+    id: String,
+    server_name: String,
+    local_address: String,
+) -> crate::models::ServerInfo {
+    crate::models::ServerInfo {
+        operating_system_display_name: None,
+        has_pending_restart: None,
+        is_shutting_down: None,
+        supports_library_monitor: None,
+        web_socket_port_number: None,
+        completed_installations: None,
+        can_self_restart: None,
+        can_launch_web_browser: None,
+        program_data_path: None,
+        web_path: None,
+        items_by_name_path: None,
+        cache_path: None,
+        log_path: None,
+        internal_metadata_path: None,
+        transcoding_temp_path: None,
+        cast_receiver_applications: None,
+        has_update_available: None,
+        encoder_location: None,
+        system_architecture: None,
+        local_address,
+        server_name,
+        version: Some(JELLYFIN_UI_VERSION.clone().unwrap_or_default().version),
+        operating_system: Some(std::env::consts::OS.to_string()),
+        id,
+        startup_wizard_completed: Some(true),
     }
 }
