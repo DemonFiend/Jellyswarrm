@@ -290,6 +290,16 @@ impl ItemsResponseVariants {
         }
     }
 
+    /// The total number of items the upstream reports for the query (its `TotalRecordCount`),
+    /// independent of how many rows came back in this page. A bare array carries no count, so
+    /// fall back to what we actually received.
+    pub fn total_record_count(&self) -> usize {
+        match self {
+            ItemsResponseVariants::WithCount(w) => w.total_record_count.max(0) as usize,
+            ItemsResponseVariants::Bare(v) => v.len(),
+        }
+    }
+
     /// Consume self and return the inner items as a plain `Vec`.
     pub fn into_items(self) -> Vec<MediaItem> {
         match self {

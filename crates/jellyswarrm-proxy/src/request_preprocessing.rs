@@ -316,7 +316,7 @@ pub async fn preprocess_request(req: Request, state: &AppState) -> Result<Prepro
         .ok_or_else(|| anyhow!("failed to clone preprocessed request body"))?;
 
     let (server, session) =
-        resolve_server(&sessions, &request_body_result, state, &request).await?;
+        resolve_server(&sessions, &request_body_result, &user, state, &request).await?;
 
     let new_auth = remap_authorization(&auth, &session).await?;
 
@@ -460,6 +460,7 @@ pub async fn remap_authorization(
 pub async fn resolve_server(
     sessions: &Option<Vec<(AuthorizationSession, Server)>>,
     request_body_result: &Option<RequestBodyAnalysisResult>,
+    user: &Option<User>,
     state: &AppState,
     request: &reqwest::Request,
 ) -> Result<(Server, Option<AuthorizationSession>)> {
@@ -478,13 +479,22 @@ pub async fn resolve_server(
     }
 
     if let Some(sessions) = sessions {
-        if let Some(request_server) = request_server {
+        if let Some(request_server) = &request_server {
             if let Some((session, server)) = sessions
                 .iter()
                 .find(|(_, server)| request_server.id == server.id)
             {
                 debug!("Found server in request: {}", server.url);
                 return Ok((server.clone(), Some(session.clone())));
+            }
+
+            // The request targets a specific server that has no device-matched session in this
+            // set (it may have been authenticated under a different device id). Authenticate to
+            // the *correct* server with any valid session the user holds for it, rather than
+            // falling back to the wrong server below.
+            if let Some(session) = session_for_server(user, request_server, state).await? {
+                debug!("Using cross-device session for server: {}", request_server.url);
+                return Ok((request_server.clone(), Some(session)));
             }
         }
 
@@ -495,13 +505,42 @@ pub async fn resolve_server(
     }
 
     if let Some(request_server) = request_server {
-        debug!("Using request server: {}", request_server.url);
+        // No device-matched sessions for this request, but it targets a known server. Use a
+        // session the user holds for that server so the upstream receives a valid token —
+        // without this a bare /Items/{id} fetch (e.g. the Media Bar slideshow) goes out
+        // unauthenticated and the upstream answers 401.
+        if let Some(session) = session_for_server(user, &request_server, state).await? {
+            debug!("Using user session for request server: {}", request_server.url);
+            return Ok((request_server, Some(session)));
+        }
+        debug!("Using request server (unauthenticated): {}", request_server.url);
         return Ok((request_server, None));
     }
 
     let server = state.server_storage.get_best_server().await?;
     let server = server.ok_or_else(|| anyhow!("No server available"))?;
     Ok((server, None))
+}
+
+/// Find any non-expired session `user` holds for `server`, ignoring device matching.
+/// Used when a request targets a specific server that the current device's filtered session
+/// set doesn't cover, so the upstream still receives a valid token instead of a 401.
+async fn session_for_server(
+    user: &Option<User>,
+    server: &Server,
+    state: &AppState,
+) -> Result<Option<AuthorizationSession>> {
+    let Some(user) = user else {
+        return Ok(None);
+    };
+    let sessions = state
+        .user_authorization
+        .get_user_sessions(&user.id, None)
+        .await?;
+    Ok(sessions
+        .into_iter()
+        .find(|(_, candidate)| candidate.id == server.id)
+        .map(|(session, _)| session))
 }
 
 async fn server_from_request_media_ids(

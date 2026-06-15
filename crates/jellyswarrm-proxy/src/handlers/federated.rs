@@ -194,6 +194,13 @@ async fn get_items_for_merged_library(
     let wrapped_response = indexed_results
         .iter()
         .any(|(_, items)| matches!(items, ItemsResponseVariants::WithCount(_)));
+    // Sum each member library's reported TotalRecordCount so the merged total reflects every
+    // matching item, not just the (start_index + limit) slice we fetched per server. Without
+    // this the web client under-counts the library and the later pages become unreachable.
+    let upstream_total: usize = indexed_results
+        .iter()
+        .map(|(_, items)| items.total_record_count())
+        .sum();
     let mut all_items = indexed_results
         .into_iter()
         .flat_map(|(_, response)| response.into_items())
@@ -204,10 +211,10 @@ async fn get_items_for_merged_library(
         left.cmp(right)
     });
 
-    let (paged_items, total_count) = apply_pagination(all_items, pagination);
+    let (paged_items, fetched_total) = apply_pagination(all_items, pagination);
     items_response_to_json(items_response_from_shape(
         paged_items,
-        total_count,
+        upstream_total.max(fetched_total),
         pagination,
         wrapped_response,
     ))
@@ -276,12 +283,19 @@ async fn get_items_from_all_servers_interleaved(
         .iter()
         .any(|(_, items)| matches!(items, ItemsResponseVariants::WithCount(_)));
     let server_count = indexed_results.len();
+    // Sum each server's reported TotalRecordCount so the merged total covers every matching
+    // item across servers, not just the slice we fetched — otherwise the later pages are hidden.
+    let upstream_total: usize = indexed_results
+        .iter()
+        .map(|(_, items)| items.total_record_count())
+        .sum();
     let server_items = indexed_results
         .into_iter()
         .map(|(_, items)| items)
         .collect::<Vec<_>>();
     let interleaved_items = interleave_items(server_items);
-    let (paged_items, total_count) = apply_pagination(interleaved_items, pagination);
+    let (paged_items, fetched_total) = apply_pagination(interleaved_items, pagination);
+    let total_count = upstream_total.max(fetched_total);
 
     debug!(
         "Returning {} of {} interleaved items from {} servers",
