@@ -85,6 +85,23 @@ pub async fn get_items_from_all_servers_if_not_restricted(
     get_items_from_all_servers_preprocessed(&state, preprocessed).await
 }
 
+/// Keep the first item for each distinct key, preserving order. Used to collapse the federated
+/// session list to one entry per upstream server: the fan-out fetches once per entry, and a user
+/// can hold several sessions for the same server (the same upstream account — one mapping exists
+/// per user+server — just different devices), which would otherwise duplicate that server's
+/// content in every merged view.
+fn dedupe_first_by<T, K, F>(items: Vec<T>, key: F) -> Vec<T>
+where
+    K: std::hash::Hash + Eq,
+    F: Fn(&T) -> K,
+{
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter(|item| seen.insert(key(item)))
+        .collect()
+}
+
 async fn get_items_for_merged_library(
     state: &AppState,
     preprocessed: PreprocessedRequest,
@@ -95,6 +112,11 @@ async fn get_items_for_merged_library(
     if sessions.is_empty() {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // One fetch per server, not per session: a user can accumulate several sessions for the same
+    // upstream (same account, different devices), and the fan-out below would otherwise add a
+    // duplicate copy of that server's items to every merged view (and inflate the totals). Keep
+    // the first (device-matched) session per server.
+    let sessions = dedupe_first_by(sessions, |(_, server)| server.id);
 
     let pagination = pagination_from_url(original_request.url());
     let mut join_set = JoinSet::new();
@@ -247,6 +269,11 @@ async fn get_items_from_all_servers_interleaved(
     if sessions.is_empty() {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // One fetch per server, not per session: a user can accumulate several sessions for the same
+    // upstream (same account, different devices), and the fan-out below would otherwise add a
+    // duplicate copy of that server's items to every merged view (and inflate the totals). Keep
+    // the first (device-matched) session per server.
+    let sessions = dedupe_first_by(sessions, |(_, server)| server.id);
 
     let pagination = pagination_from_url(original_request.url());
     let mut join_set = JoinSet::new();
@@ -338,6 +365,11 @@ async fn get_items_from_all_servers_with_merged_libraries(
     if sessions.is_empty() {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // One fetch per server, not per session: a user can accumulate several sessions for the same
+    // upstream (same account, different devices), and the fan-out below would otherwise add a
+    // duplicate copy of that server's items to every merged view (and inflate the totals). Keep
+    // the first (device-matched) session per server.
+    let sessions = dedupe_first_by(sessions, |(_, server)| server.id);
 
     let pagination = pagination_from_url(original_request.url());
     let mut join_set = JoinSet::new();
@@ -831,6 +863,15 @@ fn to_i32(value: usize) -> i32 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn dedupe_first_by_keeps_first_per_key() {
+        // Mirrors the session-per-server case: duplicate keys collapse to the first occurrence,
+        // order preserved, distinct keys all kept.
+        let items = vec![('a', 1), ('b', 1), ('c', 2), ('d', 1), ('e', 3)];
+        let deduped = dedupe_first_by(items, |(_, key)| *key);
+        assert_eq!(deduped, vec![('a', 1), ('c', 2), ('e', 3)]);
+    }
 
     #[test]
     fn has_query_key_matches_keys_not_values() {
