@@ -7,14 +7,6 @@
       Custom Tabs stores its tabs on each media server, but a browser talks to one origin &mdash; so
       Jellyswarrm has to decide whose tabs you see.
     </small>
-    <small>
-      <strong>If a tab appears in the header but opens a blank page, check the plugin version.</strong>
-      These plugins are compatible with one Jellyfin version at a time, and Custom Tabs 0.2.10.0
-      targets 10.10.7 while current servers run 10.11. On a mismatch the plugin's own rendering
-      throws <code>Cannot find module './'</code> in the browser console and the tab's content never
-      loads. That happens the same way connecting straight to a server, so it is not something these
-      settings can change &mdash; Jellyswarrm delivers the tab list correctly either way.
-    </small>
 
     <label>
       <input type="radio" name="custom_tabs_mode" value="pinned" {% if mode_pinned %}checked{% endif %}>
