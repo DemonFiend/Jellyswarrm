@@ -24,28 +24,30 @@ use tracing::{debug, error, warn};
 
 use crate::{proxy_headers::is_hop_by_hop_header, AppState};
 
-/// Top-level route prefixes owned by the client-side plugins.
-///
-/// These are registered by plugins as their own controllers, so they are siblings of `/web` rather
-/// than children of it. The injected scripts request them with relative URLs, meaning they arrive
-/// at the proxy's origin and have to be forwarded to the host that actually runs the plugin.
-///
-/// Only asset and configuration surfaces belong here. Endpoints that return media items are data,
-/// not chrome, and federating those across servers is a separate concern handled elsewhere — a
-/// route added here would be pinned to one server and silently stop merging.
-pub const PLUGIN_ASSET_PREFIXES: &[&str] = &[
-    "/PluginPages",
-    "/MediaBar",
-    "/CustomTabs",
-    "/HomeScreen/home-screen-sections.js",
-    "/HomeScreen/home-screen-sections.css",
-];
-
 /// Whether the configured client host should serve this path.
-pub fn is_plugin_asset_path(path: &str) -> bool {
-    PLUGIN_ASSET_PREFIXES
-        .iter()
-        .any(|prefix| path.eq_ignore_ascii_case(prefix) || starts_with_segment(path, prefix))
+///
+/// The prefixes are configuration rather than a constant: they are top-level routes registered by
+/// whichever client-side plugins are installed, so the correct list depends on the deployment. The
+/// shipped default is in [`crate::config::PluginFederationConfig`].
+///
+/// Only asset and configuration surfaces belong in that list. Endpoints that return media items are
+/// data, not chrome, and federating those across servers is a separate concern — a route added here
+/// would be pinned to one server and silently stop merging.
+pub fn is_plugin_asset_path(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| {
+        path.eq_ignore_ascii_case(prefix) || starts_with_segment(path, prefix.as_str())
+    })
+}
+
+/// The configured plugin asset prefixes.
+pub async fn plugin_asset_prefixes(state: &AppState) -> Vec<String> {
+    state
+        .config
+        .read()
+        .await
+        .plugin_federation
+        .plugin_asset_prefixes
+        .clone()
 }
 
 /// Prefix match on a path-segment boundary, so `/MediaBarSomethingElse` does not match `/MediaBar`.
@@ -203,8 +205,9 @@ pub async fn plugin_asset_handler(
     // Guard the pin rather than trusting route registration alone. Pinning a data endpoint here
     // would silently make that surface single-server, which is precisely the defect being removed,
     // and a route added to the wrong list is an easy mistake to make.
+    let prefixes = plugin_asset_prefixes(&state).await;
     let path = req.uri().path();
-    if !is_plugin_asset_path(path) {
+    if !is_plugin_asset_path(path, &prefixes) {
         error!("Refusing to pin {path} to the web client host: it is not a plugin asset route");
         return Err(StatusCode::NOT_FOUND);
     }
@@ -234,18 +237,54 @@ pub fn scrub_upstream_identity(headers: &mut HeaderMap) {
 mod tests {
     use super::*;
 
+    /// The shipped defaults, which are what every existing deployment gets.
+    fn prefixes() -> Vec<String> {
+        crate::config::PluginFederationConfig::default().plugin_asset_prefixes
+    }
+
     #[test]
     fn plugin_asset_paths_match_on_segment_boundaries() {
-        assert!(is_plugin_asset_path("/MediaBar"));
-        assert!(is_plugin_asset_path("/MediaBar/WebConfig"));
-        assert!(is_plugin_asset_path("/mediabar/webconfig"));
-        assert!(is_plugin_asset_path("/PluginPages/inject.js"));
-        assert!(is_plugin_asset_path("/CustomTabs/Config"));
-        assert!(is_plugin_asset_path("/HomeScreen/home-screen-sections.js"));
+        let p = prefixes();
+        assert!(is_plugin_asset_path("/MediaBar", &p));
+        assert!(is_plugin_asset_path("/MediaBar/WebConfig", &p));
+        assert!(is_plugin_asset_path("/mediabar/webconfig", &p));
+        assert!(is_plugin_asset_path("/PluginPages/inject.js", &p));
+        assert!(is_plugin_asset_path("/CustomTabs/Config", &p));
+        assert!(is_plugin_asset_path("/HomeScreen/home-screen-sections.js", &p));
 
         // A prefix that merely starts with the same letters is a different route.
-        assert!(!is_plugin_asset_path("/MediaBarSomethingElse"));
-        assert!(!is_plugin_asset_path("/PluginPagesExtra/thing"));
+        assert!(!is_plugin_asset_path("/MediaBarSomethingElse", &p));
+        assert!(!is_plugin_asset_path("/PluginPagesExtra/thing", &p));
+    }
+
+    /// Moving the list into configuration must not change what an unconfigured deployment does.
+    #[test]
+    fn the_default_prefixes_match_the_list_this_replaced() {
+        assert_eq!(
+            prefixes(),
+            vec![
+                "/PluginPages",
+                "/MediaBar",
+                "/CustomTabs",
+                "/HomeScreen/home-screen-sections.js",
+                "/HomeScreen/home-screen-sections.css",
+            ]
+        );
+    }
+
+    /// An operator removing a prefix has to actually stop it being pinned, or the setting is a lie.
+    #[test]
+    fn a_removed_prefix_is_no_longer_pinned() {
+        let without_mediabar: Vec<String> = prefixes()
+            .into_iter()
+            .filter(|p| p != "/MediaBar")
+            .collect();
+
+        assert!(!is_plugin_asset_path("/MediaBar/WebConfig", &without_mediabar));
+        assert!(is_plugin_asset_path(
+            "/CustomTabs/Config",
+            &without_mediabar
+        ));
     }
 
     /// Section *data* must never be pinned here. These endpoints return media items and have to be
@@ -253,12 +292,14 @@ mod tests {
     /// which is the exact defect this work exists to remove.
     #[test]
     fn section_data_endpoints_are_not_treated_as_assets() {
-        assert!(!is_plugin_asset_path("/HomeScreen/Sections"));
+        let p = prefixes();
+        assert!(!is_plugin_asset_path("/HomeScreen/Sections", &p));
         assert!(!is_plugin_asset_path(
-            "/HomeScreen/Section/RecentlyAddedMovies"
+            "/HomeScreen/Section/RecentlyAddedMovies",
+            &p
         ));
-        assert!(!is_plugin_asset_path("/HomeScreen/Meta"));
-        assert!(!is_plugin_asset_path("/HomeScreen/CachedImage/abc"));
+        assert!(!is_plugin_asset_path("/HomeScreen/Meta", &p));
+        assert!(!is_plugin_asset_path("/HomeScreen/CachedImage/abc", &p));
     }
 
     /// A pinned host that is merely restarting must not take the whole UI down. The fallback maps

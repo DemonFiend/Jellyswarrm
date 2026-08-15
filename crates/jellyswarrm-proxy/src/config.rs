@@ -277,6 +277,98 @@ pub struct DebugUser {
     pub password: Password,
 }
 
+/// Where the tab list served at `/CustomTabs/config` comes from.
+///
+/// Custom Tabs stores its tabs per server, but a browser talks to one origin, so the proxy has to
+/// decide whose tabs are real. The default preserves the behaviour this replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CustomTabsMode {
+    /// Only the pinned client host's tabs. Tabs configured on any other server are invisible, with
+    /// nothing logged — which is why this is worth being able to change.
+    #[default]
+    Pinned,
+    /// Every server's tabs, concatenated and deduplicated by title.
+    Merged,
+    /// Only tabs defined on the proxy. Upstream tabs are ignored, so a tab can exist for people
+    /// coming through the proxy without existing for anyone connecting to a server directly.
+    Proxy,
+}
+
+/// A tab defined on the proxy rather than on a media server.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProxyCustomTab {
+    pub title: String,
+    #[serde(default)]
+    pub content_html: String,
+}
+
+fn default_custom_tabs_mode() -> CustomTabsMode {
+    CustomTabsMode::Pinned
+}
+
+fn default_custom_tabs() -> Vec<ProxyCustomTab> {
+    Vec::new()
+}
+
+/// Top-level routes relayed to the pinned client host.
+///
+/// `/MediaBar` is kept even though the current Media Bar release loads its script from a CDN rather
+/// than serving it — the plugin still exposes configuration endpoints under that prefix, and older
+/// releases self-host the asset.
+fn default_plugin_asset_prefixes() -> Vec<String> {
+    [
+        "/PluginPages",
+        "/MediaBar",
+        "/CustomTabs",
+        "/HomeScreen/home-screen-sections.js",
+        "/HomeScreen/home-screen-sections.css",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Home screen sections whose content comes from an external service rather than the local library,
+/// matched as normalised prefixes because the plugin names variants by suffix.
+fn default_single_source_section_prefixes() -> Vec<String> {
+    ["discover", "myjellyseerrrequests", "jellyseerr", "upcoming"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Sections that list the user's libraries rather than media items.
+fn default_library_view_sections() -> Vec<String> {
+    vec!["mymedia".to_string()]
+}
+
+/// Per-plugin federation policy.
+///
+/// Client-side plugins keep their configuration on each media server, so every one of them raises
+/// the same question: when several servers disagree, whose answer does the browser get? These were
+/// previously four separate hardcoded lists in three modules, which meant answering that question
+/// required a rebuild and gave no way to tell what the current policy was.
+#[derive(Debug, Clone, Deserialize, Serialize, DefaultFromSerde)]
+pub struct PluginFederationConfig {
+    #[serde(default = "default_custom_tabs_mode")]
+    pub custom_tabs_mode: CustomTabsMode,
+
+    /// Tabs owned by the proxy, used by [`CustomTabsMode::Proxy`] and appended by
+    /// [`CustomTabsMode::Merged`].
+    #[serde(default = "default_custom_tabs")]
+    pub custom_tabs: Vec<ProxyCustomTab>,
+
+    #[serde(default = "default_plugin_asset_prefixes")]
+    pub plugin_asset_prefixes: Vec<String>,
+
+    #[serde(default = "default_single_source_section_prefixes")]
+    pub single_source_section_prefixes: Vec<String>,
+
+    #[serde(default = "default_library_view_sections")]
+    pub library_view_sections: Vec<String>,
+}
+
 #[derive(Clone, Deserialize, Serialize, DefaultFromSerde)]
 pub struct AppConfig {
     #[serde(default = "default_server_id")]
@@ -356,6 +448,9 @@ pub struct AppConfig {
         deserialize_with = "deserialize_merge_libraries"
     )]
     pub merge_libraries: bool,
+
+    #[serde(default)]
+    pub plugin_federation: PluginFederationConfig,
 }
 
 impl fmt::Debug for AppConfig {

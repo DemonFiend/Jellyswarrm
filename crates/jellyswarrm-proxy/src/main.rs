@@ -770,6 +770,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // return media items and must federate across servers.
             .route("/PluginPages/{*path}", any(handlers::web_client::plugin_asset_handler))
             .route("/MediaBar/{*path}", any(handlers::web_client::plugin_asset_handler))
+            // The tab list is a policy decision rather than an asset: it decides whose tabs a
+            // browser sees, so it is answered here instead of being relayed to one host.
+            .route(
+                "/CustomTabs/config",
+                any(handlers::custom_tabs::custom_tabs_config),
+            )
             .route("/CustomTabs/{*path}", any(handlers::web_client::plugin_asset_handler))
             .route(
                 "/HomeScreen/home-screen-sections.js",

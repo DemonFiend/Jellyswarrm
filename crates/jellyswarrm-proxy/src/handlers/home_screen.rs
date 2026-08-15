@@ -50,40 +50,48 @@ pub enum SectionSourcing {
     LibraryViews,
 }
 
-/// Sections whose content comes from an external service rather than the local library.
+/// Normalises a section name for comparison against configured lists.
 ///
-/// Matched as prefixes because the plugin names variants by suffix (`Discover`, `DiscoverMovies`,
-/// `DiscoverTV`; `UpcomingMovies`, `UpcomingShows`, `UpcomingBooks`, `UpcomingMusic`).
-const EXTERNALLY_BACKED_PREFIXES: &[&str] = &[
-    // Jellyseerr / Overseerr discovery and request lists.
-    "discover",
-    "myjellyseerrrequests",
-    "jellyseerr",
-    // Sonarr / Radarr calendars. Every server asks the same instance.
-    "upcoming",
-];
+/// Section names arrive in whatever case and punctuation the registering plugin chose, so both
+/// sides are reduced to lowercase alphanumerics before matching.
+fn normalize_section(section_type: &str) -> String {
+    section_type
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
 
 /// Decides how a section should be sourced.
+///
+/// Both lists are configuration rather than constants: which sections are backed by an external
+/// service depends on which plugins a deployment runs, and getting it wrong previously required a
+/// rebuild to correct. Defaults are in [`crate::config::PluginFederationConfig`]. The single-source
+/// list is matched as *prefixes* because plugins name variants by suffix (`Discover`,
+/// `DiscoverMovies`, `DiscoverTV`; `UpcomingMovies`, `UpcomingShows`, `UpcomingMusic`).
 ///
 /// Unknown sections default to [`SectionSourcing::Federated`]. A third-party section registered at
 /// runtime is far more likely to be library-backed than to wrap an external service, and the cost
 /// of the two mistakes is asymmetric: federating a single-source section shows duplicates, which is
 /// obvious and reported; single-sourcing a library-backed section silently hides half the library,
 /// which is the failure this module exists to remove.
-pub fn sourcing_for(section_type: &str) -> SectionSourcing {
-    let normalized: String = section_type
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect();
+pub fn sourcing_for(
+    section_type: &str,
+    single_source_prefixes: &[String],
+    library_view_sections: &[String],
+) -> SectionSourcing {
+    let normalized = normalize_section(section_type);
 
-    if normalized == "mymedia" {
+    if library_view_sections
+        .iter()
+        .any(|name| normalize_section(name) == normalized)
+    {
         return SectionSourcing::LibraryViews;
     }
 
-    if EXTERNALLY_BACKED_PREFIXES
+    if single_source_prefixes
         .iter()
-        .any(|prefix| normalized.starts_with(prefix))
+        .any(|prefix| normalized.starts_with(&normalize_section(prefix)))
     {
         SectionSourcing::SingleServer
     } else {
@@ -101,7 +109,15 @@ pub async fn get_home_screen_section(
     state: State<AppState>,
     preprocessed: Preprocessed,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    match sourcing_for(&sectiontype) {
+    let (single_source_prefixes, library_view_sections) = {
+        let config = state.config.read().await;
+        (
+            config.plugin_federation.single_source_section_prefixes.clone(),
+            config.plugin_federation.library_view_sections.clone(),
+        )
+    };
+
+    match sourcing_for(&sectiontype, &single_source_prefixes, &library_view_sections) {
         SectionSourcing::Federated => {
             debug!("Federating home screen section '{sectiontype}' across all servers");
             get_items_from_all_servers_if_not_restricted(state, preprocessed).await
@@ -150,11 +166,22 @@ mod tests {
             "LiveTV",
         ] {
             assert_eq!(
-                sourcing_for(section),
+                sourcing(section),
                 SectionSourcing::Federated,
                 "{section} reads the local library and must be merged"
             );
         }
+    }
+
+    /// Every assertion below is about the *shipped defaults*, so moving these lists into
+    /// configuration cannot quietly change what an unconfigured deployment does.
+    fn sourcing(section: &str) -> SectionSourcing {
+        let defaults = crate::config::PluginFederationConfig::default();
+        sourcing_for(
+            section,
+            &defaults.single_source_section_prefixes,
+            &defaults.library_view_sections,
+        )
     }
 
     /// Every server points at the same Jellyseerr or Arr instance, so asking all of them returns
@@ -173,7 +200,7 @@ mod tests {
             "UpcomingMusic",
         ] {
             assert_eq!(
-                sourcing_for(section),
+                sourcing(section),
                 SectionSourcing::SingleServer,
                 "{section} comes from an external service and must not be fanned out"
             );
@@ -184,18 +211,9 @@ mod tests {
     /// depend on exact casing or punctuation.
     #[test]
     fn matching_ignores_case_and_punctuation() {
-        assert_eq!(
-            sourcing_for("discovermovies"),
-            SectionSourcing::SingleServer
-        );
-        assert_eq!(
-            sourcing_for("DISCOVER_MOVIES"),
-            SectionSourcing::SingleServer
-        );
-        assert_eq!(
-            sourcing_for("recentlyaddedmovies"),
-            SectionSourcing::Federated
-        );
+        assert_eq!(sourcing("discovermovies"), SectionSourcing::SingleServer);
+        assert_eq!(sourcing("DISCOVER_MOVIES"), SectionSourcing::SingleServer);
+        assert_eq!(sourcing("recentlyaddedmovies"), SectionSourcing::Federated);
     }
 
     /// An unanticipated section federates. The two possible mistakes are not equally bad: wrongly
@@ -204,10 +222,10 @@ mod tests {
     #[test]
     fn an_unknown_section_defaults_to_federating() {
         assert_eq!(
-            sourcing_for("SomeThirdPartySection"),
+            sourcing("SomeThirdPartySection"),
             SectionSourcing::Federated
         );
-        assert_eq!(sourcing_for(""), SectionSourcing::Federated);
+        assert_eq!(sourcing(""), SectionSourcing::Federated);
     }
 
     /// My Media lists libraries, not media. Merging it as items shows each server's libraries
@@ -215,19 +233,40 @@ mod tests {
     /// way for the user to collapse it.
     #[test]
     fn my_media_is_resolved_as_library_views() {
-        assert_eq!(sourcing_for("MyMedia"), SectionSourcing::LibraryViews);
-        assert_eq!(sourcing_for("mymedia"), SectionSourcing::LibraryViews);
+        assert_eq!(sourcing("MyMedia"), SectionSourcing::LibraryViews);
+        assert_eq!(sourcing("mymedia"), SectionSourcing::LibraryViews);
     }
 
     /// Prefix matching must not catch a longer word that merely starts the same way.
     #[test]
     fn prefix_matching_does_not_overreach() {
         // "Discovery" style names are still external-family and should single-source...
-        assert_eq!(sourcing_for("DiscoverAnime"), SectionSourcing::SingleServer);
+        assert_eq!(sourcing("DiscoverAnime"), SectionSourcing::SingleServer);
         // ...but an unrelated section that happens to contain the word is not a prefix match.
+        assert_eq!(sourcing("RecentlyDiscovered"), SectionSourcing::Federated);
+    }
+
+    /// The point of moving these out of Rust: an operator can add a section the proxy has never
+    /// heard of without a rebuild, and it takes effect.
+    #[test]
+    fn a_configured_prefix_changes_how_a_section_is_sourced() {
+        let single = vec!["mycustomarr".to_string()];
+        let views = vec!["mymedia".to_string()];
+
         assert_eq!(
-            sourcing_for("RecentlyDiscovered"),
-            SectionSourcing::Federated
+            sourcing_for("MyCustomArrUpcoming", &single, &views),
+            SectionSourcing::SingleServer,
+            "a newly configured prefix must take effect"
+        );
+        assert_eq!(
+            sourcing_for("Discover", &single, &views),
+            SectionSourcing::Federated,
+            "a prefix removed from the list must stop single-sourcing"
+        );
+        assert_eq!(
+            sourcing_for("MyMedia", &single, &[]),
+            SectionSourcing::Federated,
+            "clearing the library-view list must stop treating My Media specially"
         );
     }
 }

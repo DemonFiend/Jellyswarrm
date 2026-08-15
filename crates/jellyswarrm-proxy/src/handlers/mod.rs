@@ -1,6 +1,7 @@
 pub(crate) mod auth_keys;
 pub(crate) mod branding;
 pub(crate) mod common;
+pub(crate) mod custom_tabs;
 pub(crate) mod federated;
 pub(crate) mod home_screen;
 pub(crate) mod items;
