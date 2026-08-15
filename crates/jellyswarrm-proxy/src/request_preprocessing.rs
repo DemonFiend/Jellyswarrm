@@ -386,6 +386,8 @@ pub async fn apply_to_request(
 ) {
     remove_hop_by_hop_headers(request.headers_mut());
 
+    strip_client_accept_encoding(request);
+
     apply_host_header(request, server);
 
     apply_authorization_header(request, auth);
@@ -457,6 +459,23 @@ pub fn apply_authorization_header(
             JellyfinAuthorization::ApiKey(_) => {}
         }
     }
+}
+
+/// Drop the client's `Accept-Encoding` so reqwest negotiates its own.
+///
+/// The proxy rewrites ids inside response bodies, so it must be able to decode every response it
+/// receives. Forwarding the browser's list verbatim lets an upstream answer in an encoding reqwest
+/// was not built to decode — a current browser offers `zstd`, which is not among the enabled
+/// features — after which the body fails to parse and is relayed with every id left in upstream
+/// space. Letting reqwest advertise only what it can decode makes that unrepresentable, rather than
+/// leaving it dependent on the feature list keeping pace with browsers.
+///
+/// reqwest re-adds its own `Accept-Encoding` at execution time when the header is absent, and
+/// deliberately skips doing so for range requests — which is what we want for media streaming.
+pub fn strip_client_accept_encoding(request: &mut reqwest::Request) {
+    request
+        .headers_mut()
+        .remove(reqwest::header::ACCEPT_ENCODING);
 }
 
 pub fn apply_host_header(request: &mut reqwest::Request, server: &Server) {
@@ -682,6 +701,39 @@ mod tests {
             "ExcludeArtistIds",
             MEDIA_ID_QUERY_TAGS
         ));
+    }
+
+    /// The proxy rewrites ids inside response bodies, so it must be able to decode every response
+    /// it receives. Forwarding the browser's `Accept-Encoding` verbatim let an upstream answer in
+    /// an encoding reqwest cannot decode, after which the body failed to parse and was relayed with
+    /// upstream ids intact. Stripping the header lets reqwest advertise only what it can decode.
+    #[test]
+    fn client_accept_encoding_is_not_forwarded_upstream() {
+        let mut request = reqwest::Request::new(
+            reqwest::Method::GET,
+            url::Url::parse("http://upstream.example/Items").unwrap(),
+        );
+        request.headers_mut().insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("gzip, deflate, br, zstd"),
+        );
+        request.headers_mut().insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+
+        strip_client_accept_encoding(&mut request);
+
+        assert!(
+            !request
+                .headers()
+                .contains_key(reqwest::header::ACCEPT_ENCODING),
+            "Accept-Encoding must be stripped so reqwest negotiates an encoding it can decode"
+        );
+        assert!(
+            request.headers().contains_key(reqwest::header::ACCEPT),
+            "unrelated request headers must survive"
+        );
     }
 
     use crate::config::{AppConfig, MIGRATOR};
