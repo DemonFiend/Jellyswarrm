@@ -16,6 +16,17 @@ use crate::user_authorization_service::{AuthorizationSession, Device, User};
 use crate::virtual_library_service::VirtualLibraryAccessScope;
 use crate::AppState;
 
+/// Signals that the request could not be routed because no upstream server was available to serve
+/// it — every server the user can reach is confirmed offline, or the user has no session on any of
+/// them.
+///
+/// This is distinct from a malformed request. It is carried as a typed error so the extractor can
+/// answer 503 rather than 400: a backend outage reported as a client error is misleading to
+/// operators, and some Jellyfin clients treat a 4xx as "this session is bad" and drop it.
+#[derive(Debug, thiserror::Error)]
+#[error("no routable servers available for this request")]
+pub struct NoRoutableServers;
+
 pub struct RequestIdentity {
     pub auth: Option<JellyfinAuthorization>,
     pub user: Option<User>,
@@ -558,13 +569,13 @@ pub async fn resolve_server(
         }
 
         let Some((session, server)) = sessions.first() else {
-            return Err(anyhow!("no authorization sessions available"));
+            return Err(anyhow!(NoRoutableServers));
         };
         return Ok((server.clone(), Some(session.clone()), false));
     }
 
     if access_scope.is_some() {
-        return Err(anyhow!("no authorization sessions available"));
+        return Err(anyhow!(NoRoutableServers));
     }
 
     if let Some(request_server) = request_server {
@@ -897,5 +908,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(identity.user.unwrap().id, caller.id);
+    }
+
+    /// A backend outage must not be reported as a client error. Every preprocess failure used to
+    /// map to 400, including "no upstream is reachable" — which hid real outages and, because some
+    /// Jellyfin clients read a 4xx as an invalid session, could force an unnecessary re-login.
+    #[test]
+    fn unroutable_requests_are_distinguishable_from_malformed_ones() {
+        let outage: anyhow::Error = anyhow!(NoRoutableServers);
+        let malformed: anyhow::Error = anyhow!("could not parse request body");
+
+        assert!(
+            outage.downcast_ref::<NoRoutableServers>().is_some(),
+            "an outage must be identifiable by type, not by message text"
+        );
+        assert!(
+            malformed.downcast_ref::<NoRoutableServers>().is_none(),
+            "an ordinary failure must not be mistaken for an outage"
+        );
     }
 }

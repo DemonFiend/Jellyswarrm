@@ -4,7 +4,8 @@ use tracing::error;
 
 use crate::{
     request_preprocessing::{
-        preprocess_request, resolve_request_identity_from_headers_uri, PreprocessedRequest,
+        preprocess_request, resolve_request_identity_from_headers_uri, NoRoutableServers,
+        PreprocessedRequest,
     },
     user_authorization_service::{AuthorizationSession, User},
     AppState,
@@ -45,7 +46,14 @@ impl FromRequest<AppState> for Preprocessed {
     async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
         preprocess_request(req, state).await.map(Self).map_err(|e| {
             error!("Failed to preprocess request: {}", e);
-            StatusCode::BAD_REQUEST
+            // Being unable to reach any upstream is a backend outage, not a malformed request.
+            // Reporting it as 400 hid real outages in the logs, and some clients read a 4xx as
+            // "this session is invalid" and discard it, forcing an unnecessary re-login.
+            if e.downcast_ref::<NoRoutableServers>().is_some() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            }
         })
     }
 }
