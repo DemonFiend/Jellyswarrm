@@ -38,6 +38,7 @@ mod handlers;
 mod legacy_server_identity;
 mod media_storage_service;
 mod models;
+mod plugin_service;
 mod processors;
 mod proxy_headers;
 mod request_preprocessing;

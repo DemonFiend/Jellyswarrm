@@ -133,6 +133,13 @@ pub fn ui_routes() -> axum::Router<AppState> {
             axum::routing::delete(admin::servers::delete_server_admin),
         )
         .route("/libraries", get(admin::libraries::libraries_page))
+        .route("/plugins", get(admin::plugins::plugins_page))
+        .route("/plugins/inventory", get(admin::plugins::plugin_inventory))
+        .route("/plugins/install", post(admin::plugins::install))
+        .route(
+            "/plugins/repositories",
+            post(admin::plugins::add_repository_form),
+        )
         .route(
             "/libraries/list",
             get(admin::libraries::library_groups_list),
