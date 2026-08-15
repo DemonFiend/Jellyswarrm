@@ -32,6 +32,10 @@ pub static ID_FIELDS: LazyLock<FieldMatcher> = LazyLock::new(|| {
         "SeasonId",
         "MediaSourceId",
         "PlaylistItemId",
+        // Plural forms carry an array of ids: `Ids` on `POST /Playlists`, `ItemIds` on playlist and
+        // collection mutations. Without these the proxy's virtual ids were persisted upstream.
+        "Ids",
+        "ItemIds",
     ])
 });
 
