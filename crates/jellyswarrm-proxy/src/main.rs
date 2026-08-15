@@ -751,6 +751,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The client application, pinned to one origin. Registered ahead of the catch-all so
             // asset requests never reach the per-request server resolution that used to let one
             // page load draw its index.html and its chunks from two different servers.
+            // Home Screen Sections data. Registered ahead of the catch-all so section rows are
+            // merged across servers instead of being answered by whichever single server resolves.
+            .route(
+                "/HomeScreen/Section/{sectiontype}",
+                get(handlers::home_screen::get_home_screen_section),
+            )
             .route("/web", any(handlers::web_client::web_client_handler))
             .route("/web/{*path}", any(handlers::web_client::web_client_handler))
             // Plugin asset and configuration surfaces, pinned to the same origin as the client

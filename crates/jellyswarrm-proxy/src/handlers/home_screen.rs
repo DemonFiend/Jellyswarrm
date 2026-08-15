@@ -1,0 +1,206 @@
+//! Federating the Home Screen Sections plugin's data across servers.
+//!
+//! `GET /HomeScreen/Section/{sectionType}` returns a `QueryResult<BaseItemDto>` — the same shape as
+//! `/Items` — so the existing fan-out and merge machinery applies unchanged. Without this the
+//! request falls through to the catch-all and is answered by whichever single server resolves,
+//! which is why every home row showed one server's content while the library beside it showed
+//! both.
+//!
+//! Merging is *not* correct for every section, though, and that is the whole difficulty. Sections
+//! divide into two kinds:
+//!
+//! * **Library-backed** — the plugin builds them by querying its own Jellyfin. Each server computes
+//!   its own answer over its own media, so fanning out and merging gives strictly more content than
+//!   any single server could, which is the point.
+//! * **Externally-backed** — the plugin asks Jellyseerr, Sonarr or Radarr. Every server typically
+//!   points at the *same* external service, so fanning out asks one service N times and concatenates
+//!   N identical answers. Worse, those items are synthesised and carry no Jellyfin id, so the id
+//!   remapper mints a distinct virtual id per copy and deduplication cannot collapse them. The
+//!   visible result is every row duplicated.
+//!
+//! So externally-backed sections are deliberately answered by a single server.
+
+use axum::{
+    extract::{Path, State},
+    Json,
+};
+use hyper::StatusCode;
+use tracing::debug;
+
+use crate::{
+    extractors::Preprocessed,
+    handlers::{federated::get_items_from_all_servers_if_not_restricted, items::get_items},
+    AppState,
+};
+
+/// How a section's data should be obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionSourcing {
+    /// Ask every server and merge; each computes its own answer over its own library.
+    Federated,
+    /// Ask one server. Its answer does not depend on which server is asked.
+    SingleServer,
+}
+
+/// Sections whose content comes from an external service rather than the local library.
+///
+/// Matched as prefixes because the plugin names variants by suffix (`Discover`, `DiscoverMovies`,
+/// `DiscoverTV`; `UpcomingMovies`, `UpcomingShows`, `UpcomingBooks`, `UpcomingMusic`).
+const EXTERNALLY_BACKED_PREFIXES: &[&str] = &[
+    // Jellyseerr / Overseerr discovery and request lists.
+    "discover",
+    "myjellyseerrrequests",
+    "jellyseerr",
+    // Sonarr / Radarr calendars. Every server asks the same instance.
+    "upcoming",
+];
+
+/// Decides how a section should be sourced.
+///
+/// Unknown sections default to [`SectionSourcing::Federated`]. A third-party section registered at
+/// runtime is far more likely to be library-backed than to wrap an external service, and the cost
+/// of the two mistakes is asymmetric: federating a single-source section shows duplicates, which is
+/// obvious and reported; single-sourcing a library-backed section silently hides half the library,
+/// which is the failure this module exists to remove.
+pub fn sourcing_for(section_type: &str) -> SectionSourcing {
+    let normalized: String = section_type
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+
+    if EXTERNALLY_BACKED_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+    {
+        SectionSourcing::SingleServer
+    } else {
+        SectionSourcing::Federated
+    }
+}
+
+/// `GET /HomeScreen/Section/{sectiontype}`
+///
+/// The path parameter is declared all-lowercase because the routing macro lowercases whole route
+/// literals — parameter names included — when it emits its case-insensitive alias, so a camelCase
+/// name here fails to bind on the lowercased URL.
+pub async fn get_home_screen_section(
+    Path(sectiontype): Path<String>,
+    state: State<AppState>,
+    preprocessed: Preprocessed,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match sourcing_for(&sectiontype) {
+        SectionSourcing::Federated => {
+            debug!("Federating home screen section '{sectiontype}' across all servers");
+            get_items_from_all_servers_if_not_restricted(state, preprocessed).await
+        }
+        SectionSourcing::SingleServer => {
+            debug!("Serving home screen section '{sectiontype}' from a single server");
+            get_items(state, preprocessed).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rows the user actually reported as broken. Each server computes these over its own
+    /// library, so merging is both correct and the entire point.
+    #[test]
+    fn library_backed_sections_are_federated() {
+        for section in [
+            "RecentlyAddedMovies",
+            "RecentlyAddedShows",
+            "RecentlyAddedAlbums",
+            "RecentlyAddedArtists",
+            "RecentlyAddedBooks",
+            "RecentlyAddedAudioBooks",
+            "RecentlyAddedMusicVideos",
+            "LatestMovies",
+            "LatestShows",
+            "LatestAlbums",
+            "LatestBooks",
+            "LatestAudioBooks",
+            "LatestMusicVideo",
+            "NextUp",
+            "ContinueWatching",
+            "ContinueWatchingNextUp",
+            "WatchAgain",
+            "MyList",
+            "MyMedia",
+            "LiveTV",
+        ] {
+            assert_eq!(
+                sourcing_for(section),
+                SectionSourcing::Federated,
+                "{section} reads the local library and must be merged"
+            );
+        }
+    }
+
+    /// Every server points at the same Jellyseerr or Arr instance, so asking all of them returns
+    /// the same list several times. The items carry no Jellyfin id, so nothing downstream can
+    /// collapse the copies and the row renders duplicated.
+    #[test]
+    fn externally_backed_sections_are_answered_by_one_server() {
+        for section in [
+            "Discover",
+            "DiscoverMovies",
+            "DiscoverTV",
+            "MyJellyseerrRequests",
+            "UpcomingMovies",
+            "UpcomingShows",
+            "UpcomingBooks",
+            "UpcomingMusic",
+        ] {
+            assert_eq!(
+                sourcing_for(section),
+                SectionSourcing::SingleServer,
+                "{section} comes from an external service and must not be fanned out"
+            );
+        }
+    }
+
+    /// Section ids arrive from a client and from third-party registrations, so matching cannot
+    /// depend on exact casing or punctuation.
+    #[test]
+    fn matching_ignores_case_and_punctuation() {
+        assert_eq!(
+            sourcing_for("discovermovies"),
+            SectionSourcing::SingleServer
+        );
+        assert_eq!(
+            sourcing_for("DISCOVER_MOVIES"),
+            SectionSourcing::SingleServer
+        );
+        assert_eq!(
+            sourcing_for("recentlyaddedmovies"),
+            SectionSourcing::Federated
+        );
+    }
+
+    /// An unanticipated section federates. The two possible mistakes are not equally bad: wrongly
+    /// federating shows visible duplicates, while wrongly single-sourcing silently hides half the
+    /// library — which is precisely the bug being fixed.
+    #[test]
+    fn an_unknown_section_defaults_to_federating() {
+        assert_eq!(
+            sourcing_for("SomeThirdPartySection"),
+            SectionSourcing::Federated
+        );
+        assert_eq!(sourcing_for(""), SectionSourcing::Federated);
+    }
+
+    /// Prefix matching must not catch a longer word that merely starts the same way.
+    #[test]
+    fn prefix_matching_does_not_overreach() {
+        // "Discovery" style names are still external-family and should single-source...
+        assert_eq!(sourcing_for("DiscoverAnime"), SectionSourcing::SingleServer);
+        // ...but an unrelated section that happens to contain the word is not a prefix match.
+        assert_eq!(
+            sourcing_for("RecentlyDiscovered"),
+            SectionSourcing::Federated
+        );
+    }
+}
