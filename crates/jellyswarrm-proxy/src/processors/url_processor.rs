@@ -36,6 +36,9 @@ pub static MEDIA_ID_QUERY_TAGS: &[&str] = &[
     "AlbumIds",
     "ParentId",
     "ItemId",
+    "ItemIds",
+    "ExcludeItemIds",
+    "AncestorIds",
     "SeriesId",
     "MediaSourceId",
     "SeasonId",
@@ -666,6 +669,68 @@ mod tests {
                 .find(|(key, _)| key.eq_ignore_ascii_case("ContributingArtistIds"))
                 .map(|(_, value)| value.into_owned()),
             Some(mapping.original_media_id)
+        );
+    }
+
+    /// `ItemIds` (plural) is used by `/Sessions/{id}/Playing`, `/Playlists/{id}/Items` and the
+    /// `/Items` filters. Only the singular `ItemId` was matched, so a virtual id in the plural
+    /// form reached the upstream server verbatim and resolved to nothing there.
+    #[tokio::test]
+    async fn item_ids_query_param_is_remapped_including_comma_separated_lists() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let server_storage = ServerStorageService::new(pool.clone());
+        let server_id = server_storage
+            .add_server(
+                "Server",
+                "http://server.example",
+                100,
+                MediaStreamingMode::Redirect,
+            )
+            .await
+            .unwrap();
+        let server = server_storage
+            .get_server_by_id(server_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let media_storage = MediaStorageService::new(pool.clone());
+        let first = media_storage
+            .get_or_create_media_mapping("upstream-one", &server)
+            .await
+            .unwrap();
+        let second = media_storage
+            .get_or_create_media_mapping("upstream-two", &server)
+            .await
+            .unwrap();
+        let virtual_libraries =
+            VirtualLibraryService::new(pool.clone(), server_storage.clone(), media_storage.clone());
+        let processor = UrlProcessor::new(DataContext {
+            user_authorization: Arc::new(UserAuthorizationService::new(pool)),
+            server_storage: Arc::new(server_storage),
+            media_storage: Arc::new(media_storage),
+            virtual_library_service: Arc::new(virtual_libraries),
+            play_sessions: Arc::new(SessionStorage::new()),
+            config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),
+        });
+        let mut url = url::Url::parse(&format!(
+            "http://localhost/Sessions/session-id/Playing?itemIds={},{}",
+            first.virtual_media_id, second.virtual_media_id
+        ))
+        .unwrap();
+
+        processor
+            .client_to_server_url(&mut url, &None, None, Some(server_id))
+            .await;
+
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key.eq_ignore_ascii_case("itemIds"))
+                .map(|(_, value)| value.into_owned()),
+            Some(format!(
+                "{},{}",
+                first.original_media_id, second.original_media_id
+            ))
         );
     }
 }
