@@ -747,6 +747,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "/Artists",
                 Router::new().route("/", get(handlers::federated::get_items_from_all_servers)),
             )
+            // The client application, pinned to one origin. Registered ahead of the catch-all so
+            // asset requests never reach the per-request server resolution that used to let one
+            // page load draw its index.html and its chunks from two different servers.
+            .route("/web", any(handlers::web_client::web_client_handler))
+            .route("/web/{*path}", any(handlers::web_client::web_client_handler))
+            // Plugin asset and configuration surfaces, pinned to the same origin as the client
+            // that requests them. Section *data* is deliberately absent here: those endpoints
+            // return media items and must federate across servers.
+            .route("/PluginPages/{*path}", any(handlers::web_client::plugin_asset_handler))
+            .route("/MediaBar/{*path}", any(handlers::web_client::plugin_asset_handler))
+            .route("/CustomTabs/{*path}", any(handlers::web_client::plugin_asset_handler))
+            .route(
+                "/HomeScreen/home-screen-sections.js",
+                any(handlers::web_client::plugin_asset_handler),
+            )
+            .route(
+                "/HomeScreen/home-screen-sections.css",
+                any(handlers::web_client::plugin_asset_handler),
+            )
             .route("/{*path}", any(proxy_handler))
             .fallback(proxy_handler)
             .layer(
@@ -895,6 +914,13 @@ async fn index_handler(
                 error!("Failed to build redirect response: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?)
+    } else if handlers::web_client::configured_host(&state)
+        .await
+        .is_some()
+    {
+        // A pinned client host serves the application; send the browser there so the whole page
+        // load comes from one origin.
+        Ok(handlers::web_client::web_root_redirect())
     } else {
         // Servers exist, return the index.html page
         if let Some(content) = Asset::get("index.html") {

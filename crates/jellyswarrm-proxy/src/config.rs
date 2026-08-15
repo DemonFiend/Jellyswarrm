@@ -122,6 +122,17 @@ fn default_timeout() -> u64 {
     20
 }
 
+/// Origin that serves the browser's Jellyfin web client, if the proxy should not serve its own.
+///
+/// Deliberately a URL rather than a reference to a configured server. The client and the plugin UI
+/// it carries are a presentation concern, not a media concern: pointing this at a dedicated
+/// plugin-host instance that holds no libraries is a config change rather than a rewrite.
+///
+/// Empty means "serve the bundled client", which is the previous behaviour.
+fn default_web_client_host() -> String {
+    String::new()
+}
+
 /// Per-server deadline for one leg of a federated fan-out, in seconds.
 ///
 /// Deliberately shorter than [`default_timeout`]: a merged response is only as fast as its slowest
@@ -227,6 +238,7 @@ define_fallback_deserializer!(
     default_include_server_name_in_media
 );
 define_fallback_deserializer!(deserialize_timeout, u64, default_timeout);
+define_fallback_deserializer!(deserialize_web_client_host, String, default_web_client_host);
 define_fallback_deserializer!(
     deserialize_federated_leg_timeout,
     u64,
@@ -307,6 +319,12 @@ pub struct AppConfig {
     pub federated_leg_timeout: u64, // in seconds
 
     #[serde(
+        default = "default_web_client_host",
+        deserialize_with = "deserialize_web_client_host"
+    )]
+    pub web_client_host: String,
+
+    #[serde(
         default = "default_ui_route",
         deserialize_with = "deserialize_ui_route"
     )]
@@ -360,6 +378,7 @@ impl fmt::Debug for AppConfig {
             .field("session_key", &session_key)
             .field("timeout", &self.timeout)
             .field("federated_leg_timeout", &self.federated_leg_timeout)
+            .field("web_client_host", &self.web_client_host)
             .field("ui_route", &self.ui_route)
             .field("url_prefix", &self.url_prefix)
             .field("media_streaming_mode", &self.media_streaming_mode)
