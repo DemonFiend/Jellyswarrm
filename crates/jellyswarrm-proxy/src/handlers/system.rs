@@ -7,6 +7,25 @@ use crate::{
     request_preprocessing::JellyfinAuthorization, ui::JELLYFIN_UI_VERSION, AppState,
 };
 
+/// Whether a string is shaped like a Jellyfin server version - dot-separated numbers.
+///
+/// jellyfin-web parses this value and refuses to start with "Update Required" if it cannot, so a
+/// malformed value is indistinguishable to the user from a genuinely unsupported server. The
+/// version is read from a generated `ui-version.env`, and a build that skips UI generation can
+/// leave a stale or malformed file behind. One observed case embedded a literal backslash-n
+/// instead of a newline, so the whole remainder of the file parsed as the "version" and the client
+/// would not load at all.
+///
+/// Validating the shape here means a bad file degrades to the fallback rather than bricking the
+/// client.
+fn is_version_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').count() >= 2
+        && value
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
 fn reported_server_version() -> String {
     // Jellyfin Web refuses to load when Version is empty/unknown ("Update Required").
     // Always report the embedded web client's version so the UI stays compatible.
@@ -16,8 +35,8 @@ fn reported_server_version() -> String {
         .version
         .trim()
         .to_string();
-    if version.is_empty() || version.eq_ignore_ascii_case("unknown") {
-        // Fallback for test builds that skip ui-version.env generation.
+    if !is_version_shaped(&version) {
+        // Fallback for test builds that skip ui-version.env generation, and for a malformed file.
         "10.11.0".to_string()
     } else {
         version

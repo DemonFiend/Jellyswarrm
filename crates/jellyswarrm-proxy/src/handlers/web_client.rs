@@ -164,6 +164,15 @@ pub async fn plugin_asset_handler(
         return Err(StatusCode::NOT_FOUND);
     };
 
+    // Guard the pin rather than trusting route registration alone. Pinning a data endpoint here
+    // would silently make that surface single-server, which is precisely the defect being removed,
+    // and a route added to the wrong list is an easy mistake to make.
+    let path = req.uri().path();
+    if !is_plugin_asset_path(path) {
+        error!("Refusing to pin {path} to the web client host: it is not a plugin asset route");
+        return Err(StatusCode::NOT_FOUND);
+    }
+
     relay_to_client_host(&state, &host, req).await
 }
 
