@@ -114,13 +114,30 @@ impl FromRequestParts<AppState> for SessionContext {
             return Err(StatusCode::UNAUTHORIZED);
         };
 
+        // The token is hashed rather than embedded. A SyncPlay session id only has to be stable and
+        // unique per (user, device-or-token); it does not need to be reversible. It is carried in
+        // websocket bookkeeping and logged at debug level, so putting a live access token in it put
+        // a working credential into the logs of anyone running with debug enabled.
         let session_id = match identity.device {
-            Some(d) if !d.device_id.is_empty() => format!("{}:{}:{}", user.id, d.device_id, token),
-            _ => format!("{}:token:{}", user.id, token),
+            Some(d) if !d.device_id.is_empty() => {
+                format!("{}:{}:{}", user.id, d.device_id, fingerprint_token(&token))
+            }
+            _ => format!("{}:token:{}", user.id, fingerprint_token(&token)),
         };
 
         Ok(SessionContext { user, session_id })
     }
+}
+
+/// Derives a stable, non-reversible fingerprint of an access token for use in session ids.
+///
+/// Only the leading bytes are kept: the id needs to distinguish tokens, not authenticate them, and
+/// a shorter value keeps the composite id readable in logs.
+fn fingerprint_token(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(token.as_bytes());
+    hex::encode(&digest[..8])
 }
 
 fn user_id_from_session_id(session_id: &str) -> Option<&str> {
@@ -1063,4 +1080,38 @@ pub async fn get_utc_time(
         request_reception_time,
         response_transmission_time,
     }))
+}
+
+#[cfg(test)]
+mod session_id_tests {
+    use super::*;
+
+    /// A SyncPlay session id is kept in websocket bookkeeping and logged at debug level, so it must
+    /// not contain a live access token. It still has to distinguish tokens and keep the user id as
+    /// its first segment, which is what `user_id_from_session_id` reads.
+    #[test]
+    fn session_ids_fingerprint_the_token_instead_of_embedding_it() {
+        let token = "a-live-access-token";
+        let session_id = format!("user-1:device-1:{}", fingerprint_token(token));
+
+        assert!(
+            !session_id.contains(token),
+            "the raw token must never appear in a session id"
+        );
+        assert_eq!(
+            user_id_from_session_id(&session_id),
+            Some("user-1"),
+            "the user id must remain the first segment"
+        );
+        assert_eq!(
+            fingerprint_token(token),
+            fingerprint_token(token),
+            "the fingerprint must be stable for the same token"
+        );
+        assert_ne!(
+            fingerprint_token(token),
+            fingerprint_token("a-different-token"),
+            "different tokens must produce different session ids"
+        );
+    }
 }
