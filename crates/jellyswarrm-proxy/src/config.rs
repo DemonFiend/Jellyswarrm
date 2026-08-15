@@ -409,12 +409,38 @@ pub fn load_config() -> AppConfig {
             .add_source(config::Environment::with_prefix("JELLYSWARRM").separator("_"))
     };
 
+    // A config file that exists but cannot be read must never fall back to defaults. The defaults
+    // include the admin password published in the README, a freshly generated `server_id` (which
+    // every saved client keys on, so changing it strands them all) and a new `session_key` (which
+    // invalidates every session). Coming up silently in that state is worse than not coming up:
+    // per-field problems are already absorbed by the fallback deserializers, so reaching here means
+    // the file is structurally broken and a human needs to look at it.
+    let config_file_exists = path.exists();
     let config = match builder.build() {
-        Ok(c) => c.try_deserialize().unwrap_or_default(),
+        Ok(c) => match c.try_deserialize::<AppConfig>() {
+            Ok(config) => config,
+            Err(e) if config_file_exists => {
+                eprintln!(
+                    "Refusing to start: {path:?} exists but could not be parsed: {e}
+                     Starting with defaults here would reset the admin credentials, the server id                      and the session key. Fix or remove the file and start again."
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("No usable config found, starting with defaults: {e}");
+                AppConfig::default()
+            }
+        },
+        Err(e) if config_file_exists => {
+            eprintln!(
+                "Refusing to start: {path:?} exists but could not be loaded: {e}
+                 Starting with defaults here would reset the admin credentials, the server id and                  the session key. Fix or remove the file and start again."
+            );
+            std::process::exit(1);
+        }
         Err(e) => {
-            let config = AppConfig::default();
-            eprintln!("Failed to load config using defaults: {e}");
-            config
+            eprintln!("No usable config found, starting with defaults: {e}");
+            AppConfig::default()
         }
     };
 
@@ -553,6 +579,30 @@ mod tests {
         assert!(
             config.federated_leg_timeout > 0,
             "a zero per-leg timeout would fail every federated request"
+        );
+    }
+
+    /// The defaults are not a safe fallback for a config that failed to parse: they carry the admin
+    /// password published in the README, a freshly generated `server_id` — which every saved client
+    /// keys on — and a new `session_key`. This pins the properties that make silently defaulting
+    /// unacceptable, so the guard in `load_config` cannot be relaxed without this failing.
+    #[test]
+    fn defaults_are_not_a_safe_fallback_for_a_broken_config() {
+        let first = AppConfig::default();
+        let second = AppConfig::default();
+
+        assert_eq!(
+            first.password.as_str(),
+            "jellyswarrm",
+            "the default password is the published one, so defaulting exposes it"
+        );
+        assert_ne!(
+            first.server_id, second.server_id,
+            "server_id is regenerated per default, which would strand every saved client"
+        );
+        assert_ne!(
+            first.session_key, second.session_key,
+            "session_key is regenerated per default, which would invalidate every session"
         );
     }
 }
