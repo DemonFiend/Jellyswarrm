@@ -239,6 +239,39 @@ impl SyncPlayService {
         }
     }
 
+    /// Pushes a Jellyfin websocket message to a connected client, if one is connected.
+    ///
+    /// Jellyfin delivers remote-control commands by pushing them down the target client's
+    /// websocket. The proxy terminates that socket itself rather than relaying the upstream's, so
+    /// a command accepted by an upstream never reaches the client — the request succeeds and
+    /// nothing happens. Since the socket is already here, the proxy can deliver the message
+    /// directly instead of relaying anything.
+    ///
+    /// Returns whether a connected client was found, so the caller can fall back to forwarding
+    /// upstream when the target is a device that is not connected to this proxy.
+    pub async fn try_send_message<T: Serialize>(
+        &self,
+        session_id: &str,
+        message_type: &'static str,
+        data: &T,
+    ) -> bool {
+        let mut state = self.state.write().await;
+        if !state.ws_connections.contains_key(session_id) {
+            return false;
+        }
+        state.send_to_session(session_id, message_type, data);
+        true
+    }
+
+    /// Websocket session keys for a user, in `{user}:{device}:{token-fingerprint}` form.
+    ///
+    /// Used to find the socket belonging to a remote-control target without needing to know its
+    /// token, since only the user and device are recoverable from the upstream session list.
+    pub async fn connected_session_keys(&self) -> Vec<String> {
+        let state = self.state.read().await;
+        state.ws_connections.keys().cloned().collect()
+    }
+
     pub(super) async fn register_websocket(
         &self,
         session_id: String,

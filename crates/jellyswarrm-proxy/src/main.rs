@@ -757,6 +757,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "/HomeScreen/Section/{sectiontype}",
                 get(handlers::home_screen::get_home_screen_section),
             )
+            // Remote-control play, delivered directly to the target client's websocket. The proxy
+            // terminates that socket, so an upstream's push never reaches the client.
+            .route(
+                "/Sessions/{sessionid}/Playing",
+                post(handlers::remote_control::post_sessions_playing),
+            )
             .route("/web", any(handlers::web_client::web_client_handler))
             .route("/web/{*path}", any(handlers::web_client::web_client_handler))
             // Plugin asset and configuration surfaces, pinned to the same origin as the client

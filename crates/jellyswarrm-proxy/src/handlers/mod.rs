@@ -6,6 +6,7 @@ pub(crate) mod home_screen;
 pub(crate) mod items;
 pub(crate) mod livestreams;
 pub(crate) mod quick_connect;
+pub(crate) mod remote_control;
 pub(crate) mod syncplay;
 pub(crate) mod system;
 pub(crate) mod users;
