@@ -300,4 +300,55 @@ mod tests {
             })
             .expect("Failed to deserialize JSON into ItemsResponse");
     }
+
+    /// Jellyfin declares several of these fields nullable. They were modelled as required `String`,
+    /// and because `ItemsResponseVariants` is `#[serde(untagged)]`, one item carrying an explicit
+    /// `null` failed *both* variants — so the whole server's response failed to parse, that leg was
+    /// dropped from the fan-out, and the client got a normal 200 missing an entire server's items.
+    #[test]
+    fn items_with_null_nullable_fields_still_deserialize() {
+        let json = r#"{
+            "Items": [{
+                "Id": "abc123",
+                "Type": "Movie",
+                "People": [{"Name": null, "Id": "person-1", "Type": null}],
+                "Studios": [{"Name": null, "Id": "studio-1"}],
+                "ExternalUrls": [{"Name": null, "Url": null}],
+                "MediaSources": [{"Id": null, "Protocol": "File"}]
+            }],
+            "TotalRecordCount": 1,
+            "StartIndex": 0
+        }"#;
+
+        let parsed: ItemsResponseWithCount = serde_json::from_str(json)
+            .expect("an item with nulls in nullable fields must not fail the whole response");
+
+        assert_eq!(parsed.items.len(), 1, "the item must survive");
+        assert_eq!(parsed.total_record_count, 1);
+    }
+
+    /// The same payload must also parse through the untagged enum the fan-out actually uses,
+    /// since that is where a single bad item took the entire leg down.
+    #[test]
+    fn untagged_items_response_survives_null_nullable_fields() {
+        use crate::models::ItemsResponseVariants;
+
+        let json = r#"{
+            "Items": [{
+                "Id": "abc123",
+                "Type": "Movie",
+                "People": [{"Name": null, "Id": "person-1", "Type": null}]
+            }],
+            "TotalRecordCount": 1,
+            "StartIndex": 0
+        }"#;
+
+        let parsed: ItemsResponseVariants = serde_json::from_str(json)
+            .expect("the untagged enum must not fail on a nullable field being null");
+
+        match parsed {
+            ItemsResponseVariants::WithCount(response) => assert_eq!(response.items.len(), 1),
+            ItemsResponseVariants::Bare(_) => panic!("expected the counted variant"),
+        }
+    }
 }

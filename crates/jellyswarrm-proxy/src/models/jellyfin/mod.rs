@@ -6,6 +6,24 @@ use jellyswarrm_macros::multi_case_struct;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_with::skip_serializing_none;
 
+/// Deserializes a field that the Jellyfin contract declares nullable into `T::default()`.
+///
+/// Several fields Jellyfin documents as nullable were modelled here as required. Because
+/// [`ItemsResponseVariants`] is `#[serde(untagged)]`, one item carrying an explicit `null` in any of
+/// them fails *both* variants, so the entire server's response fails to parse. In a federated
+/// fan-out that leg is then dropped and the client receives a normal 200 carrying only the other
+/// servers' items — a single unusual item silently removes a whole server from the results.
+///
+/// `#[serde(default)]` alone is not enough: it covers a *missing* key but not an explicit `null`,
+/// which is what Jellyfin actually sends.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 use crate::{
     encryption::Password,
     models::{enums::CollectionType, jellyfin::enums::BaseItemKind},
@@ -436,6 +454,7 @@ impl MediaItem {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MediaSource {
     pub protocol: Option<String>,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub id: String,
     pub path: Option<String>,
     #[serde(rename = "Type")]
@@ -512,10 +531,11 @@ pub struct Chapter {
 #[multi_case_struct(pascal, camel)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Person {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub name: String,
     pub id: String,
     pub role: Option<String>,
-    #[serde(rename = "Type")]
+    #[serde(rename = "Type", default, deserialize_with = "null_to_default")]
     pub person_type: String,
     pub primary_image_tag: Option<String>,
     pub image_blur_hashes: Option<ImageBlurHashes>,
@@ -524,6 +544,7 @@ pub struct Person {
 #[multi_case_struct(pascal, camel)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Studio {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub name: String,
     pub id: String,
 }
@@ -536,7 +557,9 @@ pub struct GenreItem {
 #[multi_case_struct(pascal, camel)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ExternalUrl {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub name: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub url: String,
 }
 
