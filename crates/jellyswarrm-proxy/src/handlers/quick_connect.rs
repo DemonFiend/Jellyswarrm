@@ -87,8 +87,45 @@ pub struct QuickConnectAuthenticateRequest {
     pub secret: String,
 }
 
+/// Quick Connect has two identifiers with very different trust levels.
+///
+/// The `secret` is a bearer credential held only by the device that initiated the flow. The `code`
+/// is shown on screen so a human can read it out and type it into an already-signed-in device — it
+/// is public by design.
+///
+/// Storing both as keys of one map made them interchangeable: any lookup that expected a secret
+/// would happily accept a code, so the six digits displayed to the user were themselves enough to
+/// complete authentication. They are kept in separate maps here so that a code can only ever be
+/// used where a code is meant to be used, enforced by the type of the lookup rather than by
+/// remembering which string was passed.
 pub struct QuickConnectStorage {
-    sessions: Arc<Mutex<HashMap<String, QuickConnectSession>>>,
+    sessions: Arc<Mutex<QuickConnectSessions>>,
+}
+
+#[derive(Default)]
+struct QuickConnectSessions {
+    /// Keyed by secret — the bearer credential.
+    by_secret: HashMap<String, QuickConnectSession>,
+    /// Code to secret. Never holds a session itself.
+    code_to_secret: HashMap<String, String>,
+}
+
+impl QuickConnectSessions {
+    fn insert(&mut self, session: QuickConnectSession) {
+        self.code_to_secret
+            .insert(session.code.clone(), session.secret.clone());
+        self.by_secret.insert(session.secret.clone(), session);
+    }
+
+    fn remove_by_secret(&mut self, secret: &str) -> Option<QuickConnectSession> {
+        let session = self.by_secret.remove(secret)?;
+        self.code_to_secret.remove(&session.code);
+        Some(session)
+    }
+
+    fn secret_for_code(&self, code: &str) -> Option<String> {
+        self.code_to_secret.get(code).cloned()
+    }
 }
 
 impl Default for QuickConnectStorage {
@@ -100,32 +137,25 @@ impl Default for QuickConnectStorage {
 impl QuickConnectStorage {
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(QuickConnectSessions::default())),
         }
     }
 
     pub fn store_session(&self, session: QuickConnectSession) {
-        let mut sessions = self.sessions_lock();
-        sessions.insert(session.secret.clone(), session.clone());
-        sessions.insert(session.code.clone(), session);
+        self.sessions_lock().insert(session);
     }
 
-    pub fn get_session(&self, key: &str) -> Option<QuickConnectSession> {
+    /// Look a session up by its **secret**. A code will never match here.
+    pub fn get_session(&self, secret: &str) -> Option<QuickConnectSession> {
         let mut sessions = self.sessions_lock();
 
-        if let Some(session) = sessions.get(key) {
-            if session.is_expired() {
-                let secret = session.secret.clone();
-                let code = session.code.clone();
-                sessions.remove(&secret);
-                sessions.remove(&code);
-                return None;
-            }
-
-            return Some(session.clone());
+        let session = sessions.by_secret.get(secret)?;
+        if session.is_expired() {
+            sessions.remove_by_secret(secret);
+            return None;
         }
 
-        None
+        sessions.by_secret.get(secret).cloned()
     }
 
     pub fn update_session_by_code(
@@ -135,50 +165,39 @@ impl QuickConnectStorage {
     ) -> bool {
         let mut sessions = self.sessions_lock();
 
-        if let Some(session) = sessions.get(code).cloned() {
-            if session.is_expired() {
-                let secret = session.secret.clone();
-                sessions.remove(&secret);
-                sessions.remove(code);
-                return false;
-            }
+        let Some(secret) = sessions.secret_for_code(code) else {
+            return false;
+        };
+        let Some(session) = sessions.by_secret.get(&secret).cloned() else {
+            return false;
+        };
 
-            let mut updated_session = session;
-            updater(&mut updated_session);
-
-            let secret = updated_session.secret.clone();
-            sessions.insert(secret, updated_session.clone());
-            sessions.insert(code.to_string(), updated_session);
-            return true;
+        if session.is_expired() {
+            sessions.remove_by_secret(&secret);
+            return false;
         }
 
-        false
+        let mut updated_session = session;
+        updater(&mut updated_session);
+        sessions.insert(updated_session);
+        true
     }
 
     pub fn remove_session(&self, secret: &str) -> Option<QuickConnectSession> {
-        let mut sessions = self.sessions_lock();
-
-        if let Some(session) = sessions.remove(secret) {
-            sessions.remove(&session.code);
-            return Some(session);
-        }
-
-        None
+        self.sessions_lock().remove_by_secret(secret)
     }
 
     pub fn cleanup_expired(&self) -> usize {
         let mut sessions = self.sessions_lock();
-        let mut expired = Vec::new();
+        let expired: Vec<String> = sessions
+            .by_secret
+            .values()
+            .filter(|session| session.is_expired())
+            .map(|session| session.secret.clone())
+            .collect();
 
-        for session in sessions.values() {
-            if session.is_expired() {
-                expired.push((session.secret.clone(), session.code.clone()));
-            }
-        }
-
-        for (secret, code) in &expired {
-            sessions.remove(secret);
-            sessions.remove(code);
+        for secret in &expired {
+            sessions.remove_by_secret(secret);
         }
 
         expired.len()
@@ -199,7 +218,7 @@ impl QuickConnectStorage {
         });
     }
 
-    fn sessions_lock(&self) -> MutexGuard<'_, HashMap<String, QuickConnectSession>> {
+    fn sessions_lock(&self) -> MutexGuard<'_, QuickConnectSessions> {
         self.sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -374,13 +393,16 @@ async fn resolve_authorize_user_id(
     headers: &HeaderMap,
     user_id: Option<String>,
 ) -> Result<String, StatusCode> {
-    if let Some(user_id) = user_id {
-        return Ok(user_id);
-    }
-
+    // Authorizing a Quick Connect code grants a token for the named user, so the caller has to
+    // prove it *is* that user. A `userId` query parameter is not proof of anything: user ids appear
+    // in request paths and logs, so trusting one outright let anybody who had seen a user's id
+    // authorize their own pending code as that user and receive a working session.
+    //
+    // The authenticated caller is always the source of truth. A supplied `userId` is only accepted
+    // when it agrees with the token, so existing clients that send it keep working.
     let token = extract_virtual_token(headers).ok_or_else(|| {
-        warn!("Quick Connect authorize called without userId and without a virtual token");
-        StatusCode::BAD_REQUEST
+        warn!("Quick Connect authorize called without a virtual token");
+        StatusCode::UNAUTHORIZED
     })?;
 
     let user = state
@@ -392,6 +414,17 @@ async fn resolve_authorize_user_id(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    if let Some(requested) = user_id {
+        if requested != user.id {
+            warn!(
+                "Quick Connect authorize requested user {} but the caller authenticated as {}; \
+                 refusing",
+                requested, user.id
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
 
     Ok(user.id)
 }
@@ -1041,5 +1074,76 @@ mod tests {
             "existing web session should remain available"
         );
         assert_eq!(web_sessions[0].0.jellyfin_token, "web-upstream-token");
+    }
+
+    fn test_session(secret: &str, code: &str) -> QuickConnectSession {
+        QuickConnectSession::new(
+            secret.to_string(),
+            code.to_string(),
+            "device".to_string(),
+            "Device".to_string(),
+            "App".to_string(),
+            "1.0".to_string(),
+        )
+    }
+
+    /// The code is displayed on screen for a human to read out; the secret is a bearer credential.
+    /// Storing both as keys of one map made them interchangeable, so the six digits shown to the
+    /// user were enough on their own to complete authentication.
+    #[test]
+    fn a_quick_connect_code_cannot_be_used_where_a_secret_is_expected() {
+        let storage = QuickConnectStorage::new();
+        storage.store_session(test_session("secret-value", "123456"));
+
+        assert!(
+            storage.get_session("secret-value").is_some(),
+            "the secret must still resolve the session"
+        );
+        assert!(
+            storage.get_session("123456").is_none(),
+            "the public code must never resolve a session through the secret lookup"
+        );
+    }
+
+    /// `remove_session` takes a secret. Passing a code used to remove the code entry and leave the
+    /// secret entry behind, so a consumed session stayed usable.
+    #[test]
+    fn removing_a_session_clears_both_of_its_keys() {
+        let storage = QuickConnectStorage::new();
+        storage.store_session(test_session("secret-value", "123456"));
+
+        assert!(storage.remove_session("123456").is_none());
+        assert!(
+            storage.get_session("secret-value").is_some(),
+            "a code must not be able to consume a session"
+        );
+
+        assert!(storage.remove_session("secret-value").is_some());
+        assert!(storage.get_session("secret-value").is_none());
+        assert!(
+            !storage.update_session_by_code("123456", |_| {}),
+            "the code index must be cleared along with the secret"
+        );
+    }
+
+    /// Authorizing a code mints a session for the named user, so the caller must prove it is that
+    /// user. A `userId` query parameter is not proof: ids appear in paths and logs, so trusting one
+    /// let anyone who had seen a user's id authorize their own pending code as that user.
+    #[tokio::test]
+    async fn authorize_rejects_a_user_id_that_does_not_match_the_caller() {
+        let state = create_test_app_state().await;
+
+        let unauthenticated = resolve_authorize_user_id(
+            &state,
+            &HeaderMap::new(),
+            Some("some-other-user".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            unauthenticated.unwrap_err(),
+            StatusCode::UNAUTHORIZED,
+            "a bare userId with no credentials must not be accepted"
+        );
     }
 }
