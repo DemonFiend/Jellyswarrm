@@ -1,0 +1,83 @@
+<div id="plugin-federation-messages">{{ message|safe }}</div>
+
+<form hx-post="/{{ ui_route }}/plugins/federation" hx-target="#plugin-federation" hx-swap="innerHTML" hx-disabled-elt="this">
+  <fieldset>
+    <legend><strong>Custom Tabs</strong></legend>
+    <small>
+      Custom Tabs stores its tabs on each media server, but a browser talks to one origin &mdash; so
+      Jellyswarrm has to decide whose tabs you see.
+    </small>
+
+    <label>
+      <input type="radio" name="custom_tabs_mode" value="pinned" {% if mode_pinned %}checked{% endif %}>
+      Web client host only
+      <small>Only tabs from the server serving the web client. Tabs configured on any other server never appear.</small>
+    </label>
+    <label>
+      <input type="radio" name="custom_tabs_mode" value="merged" {% if mode_merged %}checked{% endif %}>
+      Combine all servers
+      <small>Every server's tabs, plus any defined below. Duplicate titles collapse, keeping the higher-priority server's copy.</small>
+    </label>
+    <label>
+      <input type="radio" name="custom_tabs_mode" value="proxy" {% if mode_proxy %}checked{% endif %}>
+      Only the tabs defined here
+      <small>Servers' own tabs are ignored. Use this for a tab that should exist through Jellyswarrm and not for anyone connecting to a server directly.</small>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend><strong>Tabs defined on Jellyswarrm</strong></legend>
+    <small>
+      Used by <em>Combine all servers</em> and <em>Only the tabs defined here</em>. The content is raw
+      HTML &mdash; an <code>&lt;iframe&gt;</code> is the usual way to embed something like Jellyseerr.
+      Leave a title blank to drop that row. The Custom Tabs plugin still has to be installed on the
+      web client host, since it provides the code that renders these.
+    </small>
+    {% for tab in tabs %}
+    <div style="margin-bottom:.75rem;">
+      <input type="text" name="tab_title" value="{{ tab.title }}" placeholder="Tab title (blank to remove)" autocomplete="off">
+      <textarea name="tab_html" rows="3" placeholder="&lt;iframe src=&quot;https://jellyseerr.example.com&quot; style=&quot;width:100%;height:calc(100vh - 7em);border:0&quot;&gt;&lt;/iframe&gt;">{{ tab.content_html }}</textarea>
+    </div>
+    {% endfor %}
+  </fieldset>
+
+  <fieldset>
+    <legend><strong>Advanced routing</strong></legend>
+    <small>One entry per line. These have working defaults; change them only if a plugin needs it.</small>
+
+    <label>Plugin asset routes
+      <textarea name="plugin_asset_prefixes" rows="5">{{ plugin_asset_prefixes }}</textarea>
+      <small>
+        Routes served by the web client host rather than being resolved per request. Add a prefix
+        here when a plugin serves its own scripts. Never add a route that returns media items &mdash;
+        those must merge across servers, and pinning one would silently hide half your library.
+      </small>
+    </label>
+
+    <label>Single-source home sections
+      <textarea name="single_source_section_prefixes" rows="4">{{ single_source_section_prefixes }}</textarea>
+      <small>
+        Home sections backed by an external service (Jellyseerr, Sonarr, Radarr) rather than your
+        libraries. Every server asks the same service, so asking all of them renders the row
+        duplicated. Matched as name prefixes. Anything not listed is combined across servers.
+      </small>
+    </label>
+
+    <label>Library-view home sections
+      <textarea name="library_view_sections" rows="2">{{ library_view_sections }}</textarea>
+      <small>
+        Sections that list your libraries instead of media, and so follow the same merging as the
+        sidebar. Without this they show each server's libraries separately, which looks like
+        duplicates you cannot remove.
+      </small>
+    </label>
+  </fieldset>
+
+  <div style="display:flex; gap:.5rem;">
+    <button type="submit">Save</button>
+    <button type="button" hx-get="/{{ ui_route }}/plugins/federation" hx-target="#plugin-federation" class="secondary">Reset</button>
+  </div>
+  <p style="font-size:.75rem; opacity:.7; margin-top:.5rem;">
+    Edits persist to TOML and take effect immediately &mdash; reload the web client to see them. No restart needed.
+  </p>
+</form>

@@ -136,6 +136,11 @@ pub fn ui_routes() -> axum::Router<AppState> {
         .route("/plugins", get(admin::plugins::plugins_page))
         .route("/plugins/inventory", get(admin::plugins::plugin_inventory))
         .route("/plugins/install", post(admin::plugins::install))
+        .route(
+            "/plugins/federation",
+            get(admin::plugin_federation::federation_form)
+                .post(admin::plugin_federation::save_federation),
+        )
         .route("/plugins/restart", post(admin::plugins::restart_pending))
         .route(
             "/plugins/repositories",

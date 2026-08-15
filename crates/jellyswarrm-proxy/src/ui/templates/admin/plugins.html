@@ -13,3 +13,17 @@
         <span>Reading plugin inventory from each server&hellip;</span>
     </div>
 </section>
+
+<details style="margin-top:2rem;">
+    <summary><strong>Federation</strong> &mdash; how per-server plugin settings are combined</summary>
+    <p>
+        Client-side plugins keep their settings on each media server. Where those disagree, these
+        decide what a browser actually sees.
+    </p>
+    <section id="plugin-federation" hx-get="/{{ ui_route }}/plugins/federation" hx-trigger="load">
+        <div class="library-board-loading" aria-live="polite">
+            <i class="fas fa-circle-notch fa-spin" aria-hidden="true"></i>
+            <span>Loading federation settings&hellip;</span>
+        </div>
+    </section>
+</details>
