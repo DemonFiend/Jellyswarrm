@@ -13,6 +13,12 @@ use crate::{
 
 pub static MEDIA_ID_PATH_TAGS: &[&str] = &[
     "Items",
+    // Session ids are minted by the proxy when it rewrites `/Sessions` responses, so they have to
+    // be translated back on the way in. Without this, remote-control endpoints — including
+    // `POST /Sessions/{id}/Playing`, which is how Media Bar's play button starts playback — send an
+    // id the upstream has never issued and get a 404. Only UUID-shaped segments are matched, so
+    // `/Sessions/Playing` and `/Sessions/Capabilities/Full` are unaffected.
+    "Sessions",
     "Audio",
     "Shows",
     "Videos",
@@ -784,5 +790,90 @@ mod tests {
             .await;
 
         assert_eq!(url.path(), "/Playlists/upstream-playlist/Items");
+    }
+
+    /// The proxy rewrites `Id` in `/Sessions` responses into its own id space, so a client posting
+    /// back to `/Sessions/{id}/Playing` sends an id the upstream never issued. Media Bar's play
+    /// button uses exactly that endpoint, and the symptom is a play button that appears to do
+    /// nothing — the request 404s and the plugin swallows it.
+    #[tokio::test]
+    async fn session_ids_in_the_path_are_remapped_to_the_upstream_id() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let server_storage = ServerStorageService::new(pool.clone());
+        let server_id = server_storage
+            .add_server(
+                "Server",
+                "http://server.example",
+                100,
+                MediaStreamingMode::Redirect,
+            )
+            .await
+            .unwrap();
+        let server = server_storage
+            .get_server_by_id(server_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let media_storage = MediaStorageService::new(pool.clone());
+        let mapping = media_storage
+            .get_or_create_media_mapping("11111111-1111-1111-1111-111111111111", &server)
+            .await
+            .unwrap();
+        let virtual_libraries =
+            VirtualLibraryService::new(pool.clone(), server_storage.clone(), media_storage.clone());
+        let processor = UrlProcessor::new(DataContext {
+            user_authorization: Arc::new(UserAuthorizationService::new(pool)),
+            server_storage: Arc::new(server_storage),
+            media_storage: Arc::new(media_storage),
+            virtual_library_service: Arc::new(virtual_libraries),
+            play_sessions: Arc::new(SessionStorage::new()),
+            config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),
+        });
+
+        let mut url = url::Url::parse(&format!(
+            "http://localhost/Sessions/{}/Playing?playCommand=PlayNow",
+            mapping.virtual_media_id
+        ))
+        .unwrap();
+        processor
+            .client_to_server_url(&mut url, &None, None, Some(server_id))
+            .await;
+        assert_eq!(
+            url.path(),
+            format!("/Sessions/{}/Playing", mapping.original_media_id)
+        );
+    }
+
+    /// `/Sessions` has non-id sub-paths that must not be touched. Only UUID-shaped segments are
+    /// treated as ids, so these pass through unchanged.
+    #[tokio::test]
+    async fn session_sub_paths_that_are_not_ids_are_left_alone() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let server_storage = ServerStorageService::new(pool.clone());
+        let media_storage = MediaStorageService::new(pool.clone());
+        let virtual_libraries =
+            VirtualLibraryService::new(pool.clone(), server_storage.clone(), media_storage.clone());
+        let processor = UrlProcessor::new(DataContext {
+            user_authorization: Arc::new(UserAuthorizationService::new(pool)),
+            server_storage: Arc::new(server_storage),
+            media_storage: Arc::new(media_storage),
+            virtual_library_service: Arc::new(virtual_libraries),
+            play_sessions: Arc::new(SessionStorage::new()),
+            config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),
+        });
+
+        for path in [
+            "/Sessions/Playing",
+            "/Sessions/Playing/Progress",
+            "/Sessions/Capabilities/Full",
+        ] {
+            let mut url = url::Url::parse(&format!("http://localhost{path}")).unwrap();
+            processor
+                .client_to_server_url(&mut url, &None, None, None)
+                .await;
+            assert_eq!(url.path(), path, "{path} must pass through untouched");
+        }
     }
 }
