@@ -500,6 +500,14 @@ pub fn apply_host_header(request: &mut reqwest::Request, server: &Server) {
     }
 }
 
+/// Rewrites a client's credentials for the server the request is being sent to.
+///
+/// Only the token is rewritten. The device identity is taken from the stored session rather than
+/// the request, which is harmless: Jellyfin binds a device to an access token when the token is
+/// minted and attributes every later request to *that* device, ignoring the `DeviceId` the header
+/// carries. Sending the client's own device id here therefore changes nothing upstream — which
+/// device a client can find itself under is decided by *which session's token* is used, and that is
+/// `UserAuthorizationService::get_user_sessions`'s business rather than this function's.
 pub async fn remap_authorization(
     auth: &Option<JellyfinAuthorization>,
     session: &Option<AuthorizationSession>,
