@@ -96,14 +96,47 @@ async fn forward_media_request(
 
     match server.media_streaming_mode {
         MediaStreamingMode::Redirect => {
-            info!("Redirecting {} to: {}", log_label, url);
+            info!("Redirecting {} to: {}", log_label, redact_url(&url));
             Ok(axum::response::Redirect::temporary(url.as_ref()).into_response())
         }
         MediaStreamingMode::Proxy => {
-            info!("Proxying {} from: {}", log_label, url);
+            info!("Proxying {} from: {}", log_label, redact_url(&url));
             proxy_request(&state.streaming_reqwest_client, request).await
         }
     }
+}
+
+/// Renders an upstream URL for logging with credential-bearing query values masked.
+///
+/// Streaming URLs carry the upstream access token as `api_key`, and these lines are logged at INFO,
+/// so logging the URL verbatim wrote a working upstream credential into ordinary operational
+/// output — and into anything shipping those logs elsewhere.
+fn redact_url(url: &url::Url) -> String {
+    const SENSITIVE: &[&str] = &["api_key", "apikey", "x-emby-token", "token"];
+
+    let has_sensitive = url
+        .query_pairs()
+        .any(|(key, _)| SENSITIVE.iter().any(|s| key.eq_ignore_ascii_case(s)));
+
+    if !has_sensitive {
+        return url.to_string();
+    }
+
+    let pairs = url
+        .query_pairs()
+        .map(|(key, value)| {
+            let value = if SENSITIVE.iter().any(|s| key.eq_ignore_ascii_case(s)) {
+                "<redacted>".to_string()
+            } else {
+                value.into_owned()
+            };
+            (key.into_owned(), value)
+        })
+        .collect::<Vec<_>>();
+
+    let mut redacted = url.clone();
+    redacted.query_pairs_mut().clear().extend_pairs(pairs);
+    redacted.to_string()
 }
 
 fn session_for_server(
@@ -392,5 +425,38 @@ mod tests {
         );
 
         assert!(matches!(result, Err(0)));
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    /// Streaming URLs carry the upstream access token as `api_key`, and the redirect/proxy lines are
+    /// logged at INFO — so logging the URL verbatim wrote a working upstream credential into
+    /// ordinary operational output.
+    #[test]
+    fn credential_query_values_are_masked_for_logging() {
+        let url = url::Url::parse(
+            "http://upstream.example/Videos/abc/stream.mkv?api_key=SECRET&Static=true",
+        )
+        .unwrap();
+
+        let logged = redact_url(&url);
+
+        assert!(!logged.contains("SECRET"), "the token must not be logged");
+        assert!(logged.contains("Static=true"), "other params are kept");
+        assert!(
+            logged.contains("upstream.example"),
+            "the host is still useful"
+        );
+    }
+
+    #[test]
+    fn urls_without_credentials_are_left_alone() {
+        let url =
+            url::Url::parse("http://upstream.example/Videos/abc/stream.mkv?Static=true").unwrap();
+
+        assert_eq!(redact_url(&url), url.to_string());
     }
 }

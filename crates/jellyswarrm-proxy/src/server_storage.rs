@@ -41,7 +41,10 @@ impl Server {
             media_streaming_mode: row
                 .try_get::<String, _>("media_streaming_mode")?
                 .parse()
-                .unwrap_or(MediaStreamingMode::Redirect),
+                // Fail safe. Redirect hands the client the upstream URL, complete with the
+                // upstream access token and hostname, so an unreadable column must not silently
+                // select it. This matches `default_media_streaming_mode`, which is also Proxy.
+                .unwrap_or(MediaStreamingMode::Proxy),
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -56,7 +59,10 @@ impl Server {
             media_streaming_mode: row
                 .try_get::<String, _>("media_streaming_mode")?
                 .parse()
-                .unwrap_or(MediaStreamingMode::Redirect),
+                // Fail safe. Redirect hands the client the upstream URL, complete with the
+                // upstream access token and hostname, so an unreadable column must not silently
+                // select it. This matches `default_media_streaming_mode`, which is also Proxy.
+                .unwrap_or(MediaStreamingMode::Proxy),
             created_at: row.try_get("server_created_at")?,
             updated_at: row.try_get("server_updated_at")?,
         })
