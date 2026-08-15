@@ -29,7 +29,10 @@ use tracing::debug;
 
 use crate::{
     extractors::Preprocessed,
-    handlers::{federated::get_items_from_all_servers_if_not_restricted, items::get_items},
+    handlers::{
+        federated::{get_items_from_all_servers_if_not_restricted, get_media_folders},
+        items::get_items,
+    },
     AppState,
 };
 
@@ -40,6 +43,11 @@ pub enum SectionSourcing {
     Federated,
     /// Ask one server. Its answer does not depend on which server is asked.
     SingleServer,
+    /// The section lists the user's libraries rather than media, so it has to go through the same
+    /// path as `/UserViews`. Merging it as ordinary items returns each server's libraries
+    /// separately — "Movies, Movies, Shows, Shows" — while the sidebar beside it shows the merged
+    /// set, which looks like duplicates the user cannot get rid of.
+    LibraryViews,
 }
 
 /// Sections whose content comes from an external service rather than the local library.
@@ -69,6 +77,10 @@ pub fn sourcing_for(section_type: &str) -> SectionSourcing {
         .flat_map(|c| c.to_lowercase())
         .collect();
 
+    if normalized == "mymedia" {
+        return SectionSourcing::LibraryViews;
+    }
+
     if EXTERNALLY_BACKED_PREFIXES
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
@@ -97,6 +109,13 @@ pub async fn get_home_screen_section(
         SectionSourcing::SingleServer => {
             debug!("Serving home screen section '{sectiontype}' from a single server");
             get_items(state, preprocessed).await
+        }
+        SectionSourcing::LibraryViews => {
+            debug!("Serving home screen section '{sectiontype}' as merged library views");
+            // Delegates to the same handler `/Library/MediaFolders` uses, which rewrites the path
+            // to `/Users/{id}/Views` and runs the library-grouping plan. That is what collapses two
+            // servers' "Movies" into the single merged library the rest of the UI shows.
+            get_media_folders(state, preprocessed).await
         }
     }
 }
@@ -128,7 +147,6 @@ mod tests {
             "ContinueWatchingNextUp",
             "WatchAgain",
             "MyList",
-            "MyMedia",
             "LiveTV",
         ] {
             assert_eq!(
@@ -190,6 +208,15 @@ mod tests {
             SectionSourcing::Federated
         );
         assert_eq!(sourcing_for(""), SectionSourcing::Federated);
+    }
+
+    /// My Media lists libraries, not media. Merging it as items shows each server's libraries
+    /// separately while the sidebar shows the merged set, so the same library appears twice with no
+    /// way for the user to collapse it.
+    #[test]
+    fn my_media_is_resolved_as_library_views() {
+        assert_eq!(sourcing_for("MyMedia"), SectionSourcing::LibraryViews);
+        assert_eq!(sourcing_for("mymedia"), SectionSourcing::LibraryViews);
     }
 
     /// Prefix matching must not catch a longer word that merely starts the same way.
