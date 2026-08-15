@@ -24,6 +24,7 @@ pub struct SettingsFormTemplate {
     pub server_name: String,
     pub include_server_name_in_media: bool,
     pub auto_create_users_on_login: bool,
+    pub web_client_host: String,
     pub ui_route: String,
 }
 
@@ -48,6 +49,7 @@ pub async fn settings_form(State(state): State<AppState>) -> impl IntoResponse {
         server_name: cfg.server_name,
         include_server_name_in_media: cfg.include_server_name_in_media,
         auto_create_users_on_login: cfg.auto_create_users_on_login,
+        web_client_host: cfg.web_client_host,
         ui_route: state.get_ui_route().await,
     };
     match form.render() {
@@ -68,6 +70,9 @@ pub struct SaveForm {
     pub include_server_name_in_media: bool,
     #[serde(default)]
     pub auto_create_users_on_login: bool,
+    // Optional: empty means "serve the bundled client".
+    #[serde(default)]
+    pub web_client_host: String,
 }
 
 pub async fn save_settings(State(state): State<AppState>, Form(form): Form<SaveForm>) -> Response {
@@ -85,6 +90,12 @@ pub async fn save_settings(State(state): State<AppState>, Form(form): Form<SaveF
         updated.server_name = form.server_name.trim().to_string();
         updated.include_server_name_in_media = form.include_server_name_in_media;
         updated.auto_create_users_on_login = form.auto_create_users_on_login;
+        // Stored without a trailing slash so it can be concatenated with request paths directly.
+        updated.web_client_host = form
+            .web_client_host
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
         match save_config(&updated) {
             Ok(()) => {
                 *cfg = updated;
@@ -118,19 +129,44 @@ pub async fn reload_config(State(state): State<AppState>) -> impl IntoResponse {
 mod tests {
     use super::*;
 
-    #[test]
-    fn settings_form_does_not_render_library_merging_control() {
-        let html = SettingsFormTemplate {
+    fn form(web_client_host: &str) -> String {
+        SettingsFormTemplate {
             server_id: "server".to_string(),
             public_address: "http://localhost:8096".to_string(),
             server_name: "Jellyswarrm".to_string(),
             include_server_name_in_media: false,
             auto_create_users_on_login: true,
+            web_client_host: web_client_host.to_string(),
             ui_route: "admin".to_string(),
         }
         .render()
-        .unwrap();
+        .unwrap()
+    }
 
-        assert!(!html.contains("name=\"merge_libraries\""));
+    #[test]
+    fn settings_form_does_not_render_library_merging_control() {
+        assert!(!form("").contains("name=\"merge_libraries\""));
+    }
+
+    /// Client-side plugins are injected into a *server's* web client, so the bundled copy carries
+    /// none of them. Without a way to point at a server that has them, the whole plugin layer is
+    /// unreachable from the UI and the setting can only be changed by hand-editing a TOML inside a
+    /// container volume.
+    #[test]
+    fn settings_form_exposes_the_web_client_host() {
+        let html = form("https://media.example.com");
+
+        assert!(html.contains("name=\"web_client_host\""));
+        assert!(
+            html.contains("https://media.example.com"),
+            "the current value must be shown so it can be seen and edited"
+        );
+    }
+
+    /// Empty is a valid, meaningful value - it means "serve the bundled client" - so the field has
+    /// to render when unset rather than being hidden.
+    #[test]
+    fn settings_form_shows_the_web_client_host_when_unset() {
+        assert!(form("").contains("name=\"web_client_host\""));
     }
 }
