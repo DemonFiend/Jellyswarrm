@@ -174,6 +174,32 @@ fn sort_items(items: &mut [MediaItem], url: &url::Url) {
     });
 }
 
+/// The `Fields` entries the merge sort needs upstream to populate for a given request.
+///
+/// Merging re-sorts items across servers, so it needs the sort key present on every item. Jellyfin
+/// gates some of those behind `Fields`: without `Fields=SortName` the field is null, and the
+/// comparator silently falls back to `Name`. That is not the same ordering — Jellyfin's `SortName`
+/// strips leading articles, so "The Matrix" sorts under M upstream but under T in the merged view,
+/// and because pagination is applied after sorting, items can land on the wrong page entirely.
+pub(super) fn required_sort_fields(url: &url::Url) -> Vec<&'static str> {
+    let mut required = Vec::new();
+
+    for criterion in sort_criteria(url) {
+        let field = match criterion.field {
+            ItemSortBy::SortName | ItemSortBy::Name => "SortName",
+            ItemSortBy::DateCreated => "DateCreated",
+            // Remaining keys read fields Jellyfin always returns on BaseItemDto.
+            _ => continue,
+        };
+
+        if !required.contains(&field) {
+            required.push(field);
+        }
+    }
+
+    required
+}
+
 fn sort_criteria(url: &url::Url) -> Vec<SortCriterion> {
     let mut fields = query_list::<ItemSortBy>(url, "SortBy");
     let mut orders = query_list::<SortOrder>(url, "SortOrder");
@@ -576,5 +602,38 @@ mod tests {
             item["CollectionType"] = json!(collection_type);
         }
         serde_json::from_value(item).unwrap()
+    }
+
+    /// The merge re-sorts across servers, so the sort key must be present on every item. Jellyfin
+    /// gates `SortName` behind `Fields`; without it the field is null and the comparator silently
+    /// degrades to a plain `Name` sort, which orders leading articles differently and — since
+    /// pagination happens after sorting — can move items onto the wrong page.
+    #[test]
+    fn default_sort_requests_the_sort_name_field() {
+        let url = url::Url::parse("http://localhost/Items").unwrap();
+
+        assert_eq!(required_sort_fields(&url), vec!["SortName"]);
+    }
+
+    #[test]
+    fn explicit_sort_keys_request_only_the_fields_they_need() {
+        let by_name = url::Url::parse("http://localhost/Items?SortBy=SortName").unwrap();
+        assert_eq!(required_sort_fields(&by_name), vec!["SortName"]);
+
+        let by_created = url::Url::parse("http://localhost/Items?SortBy=DateCreated").unwrap();
+        assert_eq!(required_sort_fields(&by_created), vec!["DateCreated"]);
+
+        let by_year = url::Url::parse("http://localhost/Items?SortBy=ProductionYear").unwrap();
+        assert!(
+            required_sort_fields(&by_year).is_empty(),
+            "keys Jellyfin always returns need no Fields entry"
+        );
+    }
+
+    #[test]
+    fn latest_still_requests_date_created() {
+        let url = url::Url::parse("http://localhost/Users/u/Items/Latest").unwrap();
+
+        assert_eq!(required_sort_fields(&url), vec!["DateCreated"]);
     }
 }

@@ -1069,16 +1069,16 @@ fn ensure_duplicate_identity_field(url: &mut url::Url) {
     ensure_item_fields(url, &["ProviderIds"]);
 }
 
+/// Asks each upstream for the fields the merge sort will need.
+///
+/// Derived from the same `sort_criteria` the merge itself uses, so the two cannot drift: previously
+/// only `DateCreated` was requested, while the default sort key is `SortName` — which Jellyfin gates
+/// behind `Fields` and therefore returned as null, silently degrading the merged ordering to a
+/// plain `Name` sort.
 fn ensure_global_sort_fields(url: &mut url::Url) {
-    let sorts_by_date_created = url.query_pairs().any(|(key, value)| {
-        key.eq_ignore_ascii_case("SortBy")
-            && value
-                .split(',')
-                .map(str::trim)
-                .any(|field| field.eq_ignore_ascii_case("DateCreated"))
-    });
-    if url.path().to_ascii_lowercase().ends_with("/latest") || sorts_by_date_created {
-        ensure_item_fields(url, &["DateCreated"]);
+    let required = postprocessing::required_sort_fields(url);
+    if !required.is_empty() {
+        ensure_item_fields(url, &required);
     }
 }
 
