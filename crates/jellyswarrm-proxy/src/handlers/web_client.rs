@@ -157,7 +157,7 @@ pub async fn web_client_handler(
     let path = req.uri().path().to_string();
 
     match relay_to_client_host(&state, &host, req).await {
-        Ok(response) => Ok(inject_proxy_tabs(&state, response).await),
+        Ok(response) => Ok(response),
         Err(_) => {
             warn!(
                 "Web client host {host} did not answer for {path}; serving the bundled client.                  Plugin UIs will be missing until it returns."
@@ -165,47 +165,6 @@ pub async fn web_client_handler(
             bundled_asset(&path).ok_or(StatusCode::BAD_GATEWAY)
         }
     }
-}
-
-/// Adds the proxy's own tab script to a relayed document, when that is enabled.
-///
-/// Only full HTML documents are touched — `/web/*` relays far more JavaScript and JSON than HTML,
-/// and a script tag appended to either would corrupt it. A body that is not valid UTF-8 is passed
-/// through untouched rather than being lossily rewritten.
-async fn inject_proxy_tabs(state: &AppState, response: Response<Body>) -> Response<Body> {
-    if !state
-        .config
-        .read()
-        .await
-        .plugin_federation
-        .render_tabs_on_proxy
-    {
-        return response;
-    }
-
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    if !crate::handlers::tab_injection::is_html_document(content_type.as_deref()) {
-        return response;
-    }
-
-    let (mut parts, body) = response.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
-        warn!("Could not read the web client document to add custom tabs; serving it unchanged");
-        return Response::from_parts(parts, Body::empty());
-    };
-    let Ok(html) = std::str::from_utf8(&bytes) else {
-        return Response::from_parts(parts, Body::from(bytes));
-    };
-
-    let injected = crate::handlers::tab_injection::inject_tab_script(html);
-    // The body grew, so the relayed length is now wrong; letting it be recomputed is safer than
-    // trusting arithmetic on a header the upstream may not have sent at all.
-    parts.headers.remove(header::CONTENT_LENGTH);
-    Response::from_parts(parts, Body::from(injected))
 }
 
 /// Serves a file from the client bundled into the proxy, for use when the pinned host is down.

@@ -311,13 +311,6 @@ fn default_custom_tabs() -> Vec<ProxyCustomTab> {
     Vec::new()
 }
 
-/// Off by default: where the Custom Tabs plugin renders correctly, having the proxy render as well
-/// would show every tab twice. This is for deployments where it does not — it hooks jellyfin-web's
-/// router, and that hook throws on 10.11, leaving a tab that opens a blank page.
-fn default_render_tabs_on_proxy() -> bool {
-    false
-}
-
 /// Top-level routes relayed to the pinned client host.
 ///
 /// `/MediaBar` is kept even though the current Media Bar release loads its script from a CDN rather
@@ -365,10 +358,6 @@ pub struct PluginFederationConfig {
     /// [`CustomTabsMode::Merged`].
     #[serde(default = "default_custom_tabs")]
     pub custom_tabs: Vec<ProxyCustomTab>,
-
-    /// Render tabs from the proxy instead of relying on the Custom Tabs plugin's own rendering.
-    #[serde(default = "default_render_tabs_on_proxy")]
-    pub render_tabs_on_proxy: bool,
 
     #[serde(default = "default_plugin_asset_prefixes")]
     pub plugin_asset_prefixes: Vec<String>,

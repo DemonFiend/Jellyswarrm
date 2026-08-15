@@ -28,7 +28,6 @@ pub struct PluginFederationTemplate {
     pub mode_pinned: bool,
     pub mode_merged: bool,
     pub mode_proxy: bool,
-    pub render_tabs_on_proxy: bool,
     pub tabs: Vec<ProxyCustomTab>,
     pub plugin_asset_prefixes: String,
     pub single_source_section_prefixes: String,
@@ -58,7 +57,6 @@ fn join_lines(values: &[String]) -> String {
 #[derive(Debug, PartialEq, Eq)]
 pub struct FederationForm {
     pub mode: CustomTabsMode,
-    pub render_tabs_on_proxy: bool,
     pub tabs: Vec<ProxyCustomTab>,
     pub plugin_asset_prefixes: Vec<String>,
     pub single_source_section_prefixes: Vec<String>,
@@ -76,8 +74,6 @@ pub struct FederationForm {
 /// with its body. That is what makes the trailing empty row in the editor harmless.
 pub fn parse_federation_form(body: &str) -> FederationForm {
     let mut mode = CustomTabsMode::Pinned;
-    // An unchecked checkbox is simply absent from the body, so absence must mean false.
-    let mut render_tabs_on_proxy = false;
     let mut titles: Vec<String> = Vec::new();
     let mut bodies: Vec<String> = Vec::new();
     let mut plugin_asset_prefixes = Vec::new();
@@ -95,7 +91,6 @@ pub fn parse_federation_form(body: &str) -> FederationForm {
                     _ => CustomTabsMode::Pinned,
                 }
             }
-            "render_tabs_on_proxy" => render_tabs_on_proxy = true,
             "tab_title" => titles.push(value.trim().to_string()),
             "tab_html" => bodies.push(value.into_owned()),
             "plugin_asset_prefixes" => plugin_asset_prefixes = parse_lines(&value),
@@ -119,7 +114,6 @@ pub fn parse_federation_form(body: &str) -> FederationForm {
 
     FederationForm {
         mode,
-        render_tabs_on_proxy,
         tabs,
         plugin_asset_prefixes,
         single_source_section_prefixes,
@@ -148,7 +142,6 @@ async fn render(state: &AppState, message: String) -> Response {
         mode_pinned: federation.custom_tabs_mode == CustomTabsMode::Pinned,
         mode_merged: federation.custom_tabs_mode == CustomTabsMode::Merged,
         mode_proxy: federation.custom_tabs_mode == CustomTabsMode::Proxy,
-        render_tabs_on_proxy: federation.render_tabs_on_proxy,
         tabs,
         plugin_asset_prefixes: join_lines(&federation.plugin_asset_prefixes),
         single_source_section_prefixes: join_lines(&federation.single_source_section_prefixes),
@@ -188,7 +181,6 @@ pub async fn save_federation(State(state): State<AppState>, body: String) -> Res
         let mut config = state.config.write().await;
         let mut updated = config.clone();
         updated.plugin_federation.custom_tabs_mode = form.mode;
-        updated.plugin_federation.render_tabs_on_proxy = form.render_tabs_on_proxy;
         updated.plugin_federation.custom_tabs = form.tabs;
         updated.plugin_federation.plugin_asset_prefixes = form.plugin_asset_prefixes;
         updated.plugin_federation.single_source_section_prefixes =

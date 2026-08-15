@@ -770,12 +770,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // return media items and must federate across servers.
             .route("/PluginPages/{*path}", any(handlers::web_client::plugin_asset_handler))
             .route("/MediaBar/{*path}", any(handlers::web_client::plugin_asset_handler))
-            // Renders custom tabs from the proxy, for deployments where the plugin's own rendering
-            // is broken. Injected into the relayed client only when enabled.
-            .route(
-                handlers::tab_injection::TAB_SCRIPT_PATH,
-                get(handlers::tab_injection::tab_script),
-            )
             // The tab list is a policy decision rather than an asset: it decides whose tabs a
             // browser sees, so it is answered here instead of being relayed to one host.
             .route(
