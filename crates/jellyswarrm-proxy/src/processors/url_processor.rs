@@ -16,6 +16,8 @@ pub static MEDIA_ID_PATH_TAGS: &[&str] = &[
     "Audio",
     "Shows",
     "Videos",
+    "Playlists",
+    "Collections",
     "PlayedItems",
     "FavoriteItems",
     "MediaSegments",
@@ -732,5 +734,55 @@ mod tests {
                 first.original_media_id, second.original_media_id
             ))
         );
+    }
+
+    /// A playlist is an ordinary item with a virtual id, but `Playlists` was missing from the path
+    /// tag list, so `/Playlists/{id}/Items` sent the proxy-minted id upstream where it resolved to
+    /// nothing. This affects single-server installs too, not just merged ones.
+    #[tokio::test]
+    async fn playlist_ids_in_the_path_are_remapped_to_the_upstream_id() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let server_storage = ServerStorageService::new(pool.clone());
+        let server_id = server_storage
+            .add_server(
+                "Server",
+                "http://server.example",
+                100,
+                MediaStreamingMode::Redirect,
+            )
+            .await
+            .unwrap();
+        let server = server_storage
+            .get_server_by_id(server_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let media_storage = MediaStorageService::new(pool.clone());
+        let mapping = media_storage
+            .get_or_create_media_mapping("upstream-playlist", &server)
+            .await
+            .unwrap();
+        let virtual_libraries =
+            VirtualLibraryService::new(pool.clone(), server_storage.clone(), media_storage.clone());
+        let processor = UrlProcessor::new(DataContext {
+            user_authorization: Arc::new(UserAuthorizationService::new(pool)),
+            server_storage: Arc::new(server_storage),
+            media_storage: Arc::new(media_storage),
+            virtual_library_service: Arc::new(virtual_libraries),
+            play_sessions: Arc::new(SessionStorage::new()),
+            config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),
+        });
+        let mut url = url::Url::parse(&format!(
+            "http://localhost/Playlists/{}/Items",
+            mapping.virtual_media_id
+        ))
+        .unwrap();
+
+        processor
+            .client_to_server_url(&mut url, &None, None, Some(server_id))
+            .await;
+
+        assert_eq!(url.path(), "/Playlists/upstream-playlist/Items");
     }
 }
