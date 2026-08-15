@@ -10,7 +10,7 @@ use crate::{
 
 async fn fetch_custom_css(server_storage: &ServerStorageService, servers: &[Server]) -> String {
     for server in servers {
-        if !server_storage.server_status(server.id).await.is_healthy() {
+        if !server_storage.server_status(server.id).await.is_routable() {
             continue;
         }
 

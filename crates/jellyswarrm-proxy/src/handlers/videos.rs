@@ -164,7 +164,7 @@ async fn resolve_play_session_server(
         .server_storage
         .server_status(server.id)
         .await
-        .is_healthy()
+        .is_routable()
     {
         error!(
             "Server {} for play session {} is not healthy",
@@ -222,7 +222,7 @@ async fn forward_preprocessed_resource(
         .server_storage
         .server_status(server.id)
         .await
-        .is_healthy()
+        .is_routable()
     {
         error!(
             "Server {} for media resource {} is not healthy",

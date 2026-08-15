@@ -296,11 +296,14 @@ pub async fn extract_request_infos(
         let mut filtered_sessions: Vec<(AuthorizationSession, Server)> =
             Vec::with_capacity(sessions.len());
         for (session, server) in sessions {
+            // Only *confirmed*-offline servers are excluded. An unprobed server stays in the
+            // fan-out: dropping it would silently halve a merged response, and every server is
+            // unprobed for the first seconds after start-up.
             if state
                 .server_storage
                 .server_status(server.id)
                 .await
-                .is_healthy()
+                .is_routable()
             {
                 filtered_sessions.push((session, server));
             }
