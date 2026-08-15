@@ -20,7 +20,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::Response,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{proxy_headers::is_hop_by_hop_header, AppState};
 
@@ -139,6 +139,10 @@ pub async fn relay_to_client_host(
 }
 
 /// `GET /web/*` — the client application itself.
+///
+/// Falls back to the bundled client when the pinned host cannot be reached. Without that, a host
+/// that is merely restarting takes the entire UI down — including the admin page needed to change
+/// this setting — which is a worse failure than losing the plugins for a minute.
 pub async fn web_client_handler(
     State(state): State<AppState>,
     req: Request,
@@ -148,7 +152,39 @@ pub async fn web_client_handler(
         return Err(StatusCode::NOT_FOUND);
     };
 
-    relay_to_client_host(&state, &host, req).await
+    let path = req.uri().path().to_string();
+
+    match relay_to_client_host(&state, &host, req).await {
+        Ok(response) => Ok(response),
+        Err(_) => {
+            warn!(
+                "Web client host {host} did not answer for {path}; serving the bundled client.                  Plugin UIs will be missing until it returns."
+            );
+            bundled_asset(&path).ok_or(StatusCode::BAD_GATEWAY)
+        }
+    }
+}
+
+/// Serves a file from the client bundled into the proxy, for use when the pinned host is down.
+fn bundled_asset(path: &str) -> Option<Response<Body>> {
+    // `/web/foo` maps onto `foo` in the embedded bundle; a bare directory means the app entry point.
+    let relative = path.trim_start_matches("/web").trim_start_matches('/');
+    let relative = if relative.is_empty() {
+        "index.html"
+    } else {
+        relative
+    };
+
+    let asset = crate::Asset::get(relative).or_else(|| crate::Asset::get("index.html"))?;
+    let mime = mime_guess::from_path(relative).first_or_octet_stream();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime.as_ref())
+        // Never let a fallback response be cached as though it were the real client.
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(asset.data.into_owned()))
+        .ok()
 }
 
 /// Plugin asset and configuration routes, pinned to the same host as the client.
@@ -223,5 +259,38 @@ mod tests {
         ));
         assert!(!is_plugin_asset_path("/HomeScreen/Meta"));
         assert!(!is_plugin_asset_path("/HomeScreen/CachedImage/abc"));
+    }
+
+    /// A pinned host that is merely restarting must not take the whole UI down. The fallback maps
+    /// `/web/...` onto the bundled client, and anything unrecognised onto its entry point so the
+    /// single-page app can still boot and route itself.
+    #[test]
+    fn the_bundled_fallback_maps_web_paths_onto_the_embedded_client() {
+        // Only meaningful when a client is actually embedded; skipped on UI-less builds.
+        if crate::Asset::get("index.html").is_none() {
+            return;
+        }
+
+        assert!(bundled_asset("/web/").is_some(), "the app entry point");
+        assert!(bundled_asset("/web").is_some(), "no trailing slash");
+        assert!(
+            bundled_asset("/web/does-not-exist.chunk.js").is_some(),
+            "an unknown path still boots the app rather than 502-ing"
+        );
+    }
+
+    /// The fallback is a degraded response and must never be cached in place of the real client,
+    /// or a single blip would persist until the browser cache is cleared.
+    #[test]
+    fn the_bundled_fallback_is_never_cached() {
+        if crate::Asset::get("index.html").is_none() {
+            return;
+        }
+
+        let response = bundled_asset("/web/").expect("entry point");
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
     }
 }

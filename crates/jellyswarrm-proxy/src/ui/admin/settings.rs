@@ -25,6 +25,12 @@ pub struct SettingsFormTemplate {
     pub include_server_name_in_media: bool,
     pub auto_create_users_on_login: bool,
     pub web_client_host: String,
+    /// URLs of the configured servers, offered as suggestions.
+    ///
+    /// A dropdown rather than a bare text field because the value is almost always one of these,
+    /// and a typo saves silently and then serves nothing. It stays a free-text input so a dedicated
+    /// plugin-host that is not a configured media server can still be entered.
+    pub server_urls: Vec<String>,
     pub ui_route: String,
 }
 
@@ -50,6 +56,14 @@ pub async fn settings_form(State(state): State<AppState>) -> impl IntoResponse {
         include_server_name_in_media: cfg.include_server_name_in_media,
         auto_create_users_on_login: cfg.auto_create_users_on_login,
         web_client_host: cfg.web_client_host,
+        server_urls: state
+            .server_storage
+            .list_servers()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|server| server.url.as_str().trim_end_matches('/').to_string())
+            .collect(),
         ui_route: state.get_ui_route().await,
     };
     match form.render() {
@@ -59,6 +73,23 @@ pub async fn settings_form(State(state): State<AppState>) -> impl IntoResponse {
             (StatusCode::INTERNAL_SERVER_ERROR, "Template error").into_response()
         }
     }
+}
+
+/// Verifies that a candidate web client host actually answers with a client.
+async fn probe_web_client_host(state: &AppState, host: &str) -> Result<(), String> {
+    let url = format!("{host}/web/index.html");
+    let response = state
+        .reqwest_client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("could not reach it: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("it answered {}", response.status()));
+    }
+
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -83,6 +114,24 @@ pub async fn save_settings(State(state): State<AppState>, Form(form): Form<SaveF
         .into_response();
     }
 
+    let web_client_host = form
+        .web_client_host
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+
+    // Check the host actually serves a client before storing it. Saving an unreachable address is
+    // not a harmless mistake: the browser client is served from it, so a typo makes the whole UI —
+    // including this settings page — unavailable until someone edits the config file by hand.
+    if !web_client_host.is_empty() {
+        if let Err(reason) = probe_web_client_host(&state, &web_client_host).await {
+            return Html(format!(
+                "<div id=\"settings-messages\" class=\"alert alert-error\">                 Not saved: {web_client_host} does not serve a web client ({reason}).                  Leave it empty to use the bundled client.</div>"
+            ))
+            .into_response();
+        }
+    }
+
     let save_result = {
         let mut cfg = state.config.write().await;
         let mut updated = cfg.clone();
@@ -91,11 +140,7 @@ pub async fn save_settings(State(state): State<AppState>, Form(form): Form<SaveF
         updated.include_server_name_in_media = form.include_server_name_in_media;
         updated.auto_create_users_on_login = form.auto_create_users_on_login;
         // Stored without a trailing slash so it can be concatenated with request paths directly.
-        updated.web_client_host = form
-            .web_client_host
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
+        updated.web_client_host = web_client_host;
         match save_config(&updated) {
             Ok(()) => {
                 *cfg = updated;
@@ -137,6 +182,10 @@ mod tests {
             include_server_name_in_media: false,
             auto_create_users_on_login: true,
             web_client_host: web_client_host.to_string(),
+            server_urls: vec![
+                "http://one.example".to_string(),
+                "http://two.example".to_string(),
+            ],
             ui_route: "admin".to_string(),
         }
         .render()

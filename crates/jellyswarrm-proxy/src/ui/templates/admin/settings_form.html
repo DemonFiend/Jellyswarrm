@@ -17,8 +17,11 @@
       <input type="checkbox" role="switch" name="auto_create_users_on_login" value="true" {% if auto_create_users_on_login %}checked{% endif %}>
     </label>
     <label>Web Client Host
-      <input type="url" name="web_client_host" value="{{ web_client_host }}"
-             placeholder="https://your-jellyfin.example.com" autocomplete="off">
+      <input type="url" name="web_client_host" value="{{ web_client_host }}" list="web-client-hosts"
+             placeholder="Pick a server, or leave empty for the bundled client" autocomplete="off">
+      <datalist id="web-client-hosts">
+        {% for url in server_urls %}<option value="{{ url }}"></option>{% endfor %}
+      </datalist>
       <small>
         Serve the browser client from this Jellyfin instead of the bundled copy. Required for
         client-side plugins &mdash; Media Bar, Home Screen Sections, Custom Tabs and Plugin Pages
