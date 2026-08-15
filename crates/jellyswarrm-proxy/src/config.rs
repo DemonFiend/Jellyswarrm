@@ -122,6 +122,15 @@ fn default_timeout() -> u64 {
     20
 }
 
+/// Per-server deadline for one leg of a federated fan-out, in seconds.
+///
+/// Deliberately shorter than [`default_timeout`]: a merged response is only as fast as its slowest
+/// leg, so a single degraded upstream must not be able to hold the whole response for the full
+/// client timeout. A leg that overruns is counted as a failure and the merge proceeds without it.
+fn default_federated_leg_timeout() -> u64 {
+    10
+}
+
 fn default_ui_route() -> UrlSegment {
     UrlSegment("ui".to_string())
 }
@@ -218,6 +227,11 @@ define_fallback_deserializer!(
     default_include_server_name_in_media
 );
 define_fallback_deserializer!(deserialize_timeout, u64, default_timeout);
+define_fallback_deserializer!(
+    deserialize_federated_leg_timeout,
+    u64,
+    default_federated_leg_timeout
+);
 define_fallback_deserializer!(deserialize_ui_route, UrlSegment, default_ui_route);
 define_fallback_deserializer!(
     deserialize_media_streaming_mode,
@@ -287,6 +301,12 @@ pub struct AppConfig {
     pub timeout: u64, // in seconds
 
     #[serde(
+        default = "default_federated_leg_timeout",
+        deserialize_with = "deserialize_federated_leg_timeout"
+    )]
+    pub federated_leg_timeout: u64, // in seconds
+
+    #[serde(
         default = "default_ui_route",
         deserialize_with = "deserialize_ui_route"
     )]
@@ -339,6 +359,7 @@ impl fmt::Debug for AppConfig {
             .field("debug_user", &self.debug_user)
             .field("session_key", &session_key)
             .field("timeout", &self.timeout)
+            .field("federated_leg_timeout", &self.federated_leg_timeout)
             .field("ui_route", &self.ui_route)
             .field("url_prefix", &self.url_prefix)
             .field("media_streaming_mode", &self.media_streaming_mode)
@@ -509,5 +530,29 @@ impl<'de> serde::Deserialize<'de> for UrlSegment {
         } else {
             Ok(UrlSegment(t))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-leg deadline only has an effect while it is strictly tighter than the shared reqwest
+    /// client timeout. If the two ever converge, a slow upstream would again be able to hold a
+    /// merged response for the full client timeout and this guard would silently stop guarding.
+    #[test]
+    fn federated_leg_timeout_is_tighter_than_the_global_client_timeout() {
+        let config = AppConfig::default();
+
+        assert!(
+            config.federated_leg_timeout < config.timeout,
+            "per-leg timeout ({}s) must stay below the global client timeout ({}s)",
+            config.federated_leg_timeout,
+            config.timeout
+        );
+        assert!(
+            config.federated_leg_timeout > 0,
+            "a zero per-leg timeout would fail every federated request"
+        );
     }
 }

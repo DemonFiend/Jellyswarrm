@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use axum::{extract::State, Json};
 use hyper::StatusCode;
@@ -271,6 +272,13 @@ async fn fetch_catalog(
 ) -> Result<FetchedCatalog, StatusCode> {
     let mut join_set = JoinSet::new();
 
+    // A merged response is only as fast as its slowest leg, and the only bound on an upstream call
+    // is the shared reqwest client timeout — so one degraded server could stall every federated
+    // response for the full client timeout, and the windowed path awaits page batches in sequence,
+    // multiplying it. Give each leg its own deadline and treat an overrun as a failure so the merge
+    // proceeds with whatever answered.
+    let leg_timeout = Duration::from_secs(state.config.read().await.federated_leg_timeout);
+
     for (index, target) in targets.into_iter().enumerate() {
         let Some(mut request) = original_request.try_clone() else {
             error!("Failed to clone request for server: {}", target.server.name);
@@ -284,57 +292,73 @@ async fn fetch_catalog(
         }
 
         let state = state.clone();
+        let server_name = target.server.name.clone();
         join_set.spawn(async move {
-            let result = match mode {
-                FetchMode::ClientWindow(pagination) => fetch_items_from_server(
-                    index,
-                    state,
-                    request,
-                    target.session,
-                    target.server,
-                    pagination,
-                    true,
-                )
-                .await
-                .map(FetchedServerItems::complete),
-                FetchMode::VirtualLibrary { pagination } => {
-                    if is_upstream_limited_catalog_request(request.url()) {
-                        fetch_items_from_server(
-                            index,
-                            state,
-                            request,
-                            target.session,
-                            target.server,
-                            pagination,
-                            false,
-                        )
-                        .await
-                        .map(FetchedServerItems::complete)
-                    } else {
-                        fetch_windowed_items_from_server(
-                            index,
-                            state,
-                            request,
-                            target.session,
-                            target.server,
-                            merged_library_max_pages(pagination),
-                            false,
-                        )
-                        .await
+            let leg = async move {
+                let result = match mode {
+                    FetchMode::ClientWindow(pagination) => fetch_items_from_server(
+                        index,
+                        state,
+                        request,
+                        target.session,
+                        target.server,
+                        pagination,
+                        true,
+                    )
+                    .await
+                    .map(FetchedServerItems::complete),
+                    FetchMode::VirtualLibrary { pagination } => {
+                        if is_upstream_limited_catalog_request(request.url()) {
+                            fetch_items_from_server(
+                                index,
+                                state,
+                                request,
+                                target.session,
+                                target.server,
+                                pagination,
+                                false,
+                            )
+                            .await
+                            .map(FetchedServerItems::complete)
+                        } else {
+                            fetch_windowed_items_from_server(
+                                index,
+                                state,
+                                request,
+                                target.session,
+                                target.server,
+                                merged_library_max_pages(pagination),
+                                false,
+                            )
+                            .await
+                        }
                     }
-                }
-                FetchMode::Inventory => fetch_raw_items_from_server(
-                    index,
-                    state,
-                    request,
-                    target.session,
-                    target.server,
-                    Pagination::unbounded(),
-                )
-                .await
-                .map(FetchedServerItems::complete),
+                    FetchMode::Inventory => fetch_raw_items_from_server(
+                        index,
+                        state,
+                        request,
+                        target.session,
+                        target.server,
+                        Pagination::unbounded(),
+                    )
+                    .await
+                    .map(FetchedServerItems::complete),
+                };
+                result
             };
-            (index, result)
+
+            match tokio::time::timeout(leg_timeout, leg).await {
+                Ok(result) => (index, result),
+                Err(_) => {
+                    error!(
+                        "Federated request to server '{}' exceeded the {}s leg timeout; \
+                         continuing without it",
+                        server_name,
+                        leg_timeout.as_secs()
+                    );
+                    (index, Err(StatusCode::GATEWAY_TIMEOUT))
+                }
+            }
         });
     }
 
