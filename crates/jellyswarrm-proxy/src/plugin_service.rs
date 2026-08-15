@@ -47,12 +47,21 @@ pub struct AvailablePlugin {
     pub description: String,
     #[serde(rename = "versions", default)]
     pub versions: Vec<AvailableVersion>,
+    /// Which repository offered this plugin. Populated by the proxy, not by Jellyfin: the catalogue
+    /// response flattens every repository together, so the grouping has to be reconstructed from
+    /// each version entry's source URL.
+    #[serde(skip)]
+    pub repository: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvailableVersion {
     #[serde(rename = "version", default)]
     pub version: String,
+    #[serde(rename = "repositoryName", default)]
+    pub repository_name: String,
+    #[serde(rename = "repositoryUrl", default)]
+    pub repository_url: String,
 }
 
 /// A repository a server fetches plugin manifests from.
@@ -268,7 +277,56 @@ pub async fn read_catalogue(
     server_id: ServerId,
 ) -> Result<Vec<AvailablePlugin>, String> {
     let session = admin_session(state, server_id).await?;
-    get_json::<Vec<AvailablePlugin>>(state, &session, "/Packages").await
+    let mut catalogue = get_json::<Vec<AvailablePlugin>>(state, &session, "/Packages").await?;
+
+    for plugin in &mut catalogue {
+        plugin.repository = plugin
+            .versions
+            .iter()
+            .map(|v| v.repository_name.trim())
+            .find(|name| !name.is_empty())
+            .unwrap_or("Other")
+            .to_string();
+    }
+
+    Ok(catalogue)
+}
+
+/// Asks a server to restart itself.
+///
+/// Jellyfin only loads plugins at start-up, so an install is inert until this happens. Exposing it
+/// here keeps the whole flow inside the admin page rather than requiring shell access to the host
+/// running the container.
+pub async fn restart_server(state: &AppState, server_id: ServerId) -> Result<(), String> {
+    let session = admin_session(state, server_id).await?;
+
+    let response = state
+        .reqwest_client
+        .post(session.url("/System/Restart"))
+        .header("X-Emby-Token", &session.token)
+        .send()
+        .await
+        .map_err(|e| format!("restart request failed: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("server answered {}", response.status()));
+    }
+
+    Ok(())
+}
+
+/// Whether any plugin on this server is staged but not yet loaded.
+pub fn awaiting_restart(inventory: &ServerPluginInventory) -> usize {
+    inventory
+        .plugins
+        .as_ref()
+        .map(|plugins| {
+            plugins
+                .iter()
+                .filter(|p| p.status.eq_ignore_ascii_case("Restart"))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// Adds a repository to a server, preserving the ones already configured.
