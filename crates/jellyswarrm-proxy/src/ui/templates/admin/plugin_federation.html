@@ -26,6 +26,21 @@
   </fieldset>
 
   <fieldset>
+    <legend><strong>Rendering</strong></legend>
+    <label>
+      <input type="checkbox" role="switch" name="render_tabs_on_proxy" value="true" {% if render_tabs_on_proxy %}checked{% endif %}>
+      Render tabs from Jellyswarrm
+      <small>
+        Turn this on if your tabs appear in the header but open a blank page. The Custom Tabs plugin
+        renders by hooking the web client's router, and that hook throws on Jellyfin&nbsp;10.11
+        (<code>Cannot find module './'</code> in the browser console), so the tab's content never
+        loads. With this on, Jellyswarrm draws the tabs itself and the plugin is not needed at all.
+        Leave it off where the plugin works, or every tab will appear twice.
+      </small>
+    </label>
+  </fieldset>
+
+  <fieldset>
     <legend><strong>Tabs defined on Jellyswarrm</strong></legend>
     <small>
       Used by <em>Combine all servers</em> and <em>Only the tabs defined here</em>. The content is raw

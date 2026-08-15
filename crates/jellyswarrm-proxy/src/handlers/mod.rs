@@ -9,6 +9,7 @@ pub(crate) mod livestreams;
 pub(crate) mod quick_connect;
 pub(crate) mod remote_control;
 pub(crate) mod syncplay;
+pub(crate) mod tab_injection;
 pub(crate) mod system;
 pub(crate) mod users;
 pub(crate) mod videos;
