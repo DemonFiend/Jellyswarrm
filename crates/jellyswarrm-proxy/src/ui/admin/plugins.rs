@@ -290,22 +290,51 @@ pub async fn plugin_inventory(State(state): State<AppState>) -> Response {
     render_inventory(&state, String::new()).await
 }
 
-#[derive(Deserialize)]
+/// A parsed install submission: which plugin, and which servers to send it to.
 pub struct InstallForm {
     /// `guid|display name`, so one button carries both without a second lookup.
     pub plugin: String,
-    /// Repeated checkbox values naming the servers to install on.
-    #[serde(default)]
-    pub target: Vec<i64>,
+    /// Server ids from the target checkboxes.
+    pub targets: Vec<i64>,
 }
 
-pub async fn install(State(state): State<AppState>, Form(form): Form<InstallForm>) -> Response {
+/// Parses the install form body.
+///
+/// Hand-parsed rather than derived because the target servers arrive as a *repeated* `target`
+/// field, one per ticked checkbox, and the form extractor deserializes each occurrence
+/// independently — a repeated field into a `Vec` fails outright with "invalid type: string,
+/// expected a sequence". Since selecting several servers at once is the whole point of the page,
+/// that broke exactly the case it exists for.
+pub fn parse_install_form(body: &str) -> InstallForm {
+    let mut plugin = String::new();
+    let mut targets = Vec::new();
+
+    for (key, value) in url::form_urlencoded::parse(body.as_bytes()) {
+        match key.as_ref() {
+            "plugin" => plugin = value.into_owned(),
+            "target" => {
+                if let Ok(id) = value.parse::<i64>() {
+                    if !targets.contains(&id) {
+                        targets.push(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    InstallForm { plugin, targets }
+}
+
+pub async fn install(State(state): State<AppState>, body: String) -> Response {
+    let form = parse_install_form(&body);
+
     let Some((guid, name)) = form.plugin.split_once('|') else {
         return render_inventory(&state, "Malformed plugin selection.".to_string()).await;
     };
     let (guid, name) = (guid.to_string(), name.to_string());
 
-    if form.target.is_empty() {
+    if form.targets.is_empty() {
         return render_inventory(
             &state,
             "No target servers selected - tick at least one server above.".to_string(),
@@ -317,7 +346,7 @@ pub async fn install(State(state): State<AppState>, Form(form): Form<InstallForm
     let mut skipped = Vec::new();
     let mut failed = Vec::new();
 
-    for server_id in form.target.iter().copied().map(ServerId::new) {
+    for server_id in form.targets.iter().copied().map(ServerId::new) {
         let server_name = state
             .server_storage
             .get_server_by_id(server_id)
@@ -672,5 +701,39 @@ mod tests {
             .find(|g| g.name == INSTALLED_ONLY_GROUP)
             .expect("orphaned installs get their own group");
         assert_eq!(group.rows[0].name, "Retired Plugin");
+    }
+
+    /// Target servers arrive as a repeated `target` field, one per ticked checkbox. The derived
+    /// form extractor rejects that outright ("invalid type: string, expected a sequence"), which
+    /// broke installing to several servers at once — the reason the page is shaped this way.
+    #[test]
+    fn repeated_target_fields_all_parse() {
+        let form = parse_install_form("plugin=abc%7CMedia+Bar&target=1&target=2&target=3");
+
+        assert_eq!(form.plugin, "abc|Media Bar");
+        assert_eq!(form.targets, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_single_target_still_parses() {
+        let form = parse_install_form("plugin=abc%7CMedia+Bar&target=2");
+        assert_eq!(form.targets, vec![2]);
+    }
+
+    /// No ticked servers is a real state — every server already has it, or the user unticked them
+    /// all — and must be reported rather than silently installing nowhere.
+    #[test]
+    fn no_targets_parses_as_empty_rather_than_failing() {
+        let form = parse_install_form("plugin=abc%7CMedia+Bar");
+        assert!(form.targets.is_empty());
+        assert_eq!(form.plugin, "abc|Media Bar");
+    }
+
+    /// A browser can repeat a value if a checkbox is duplicated in the DOM; installing twice to the
+    /// same server would be harmless but would report it twice.
+    #[test]
+    fn duplicate_targets_are_collapsed() {
+        let form = parse_install_form("plugin=a%7Cb&target=1&target=1&target=2");
+        assert_eq!(form.targets, vec![1, 2]);
     }
 }
