@@ -1,9 +1,17 @@
 {% if unreadable_count > 0 %}
 <article class="plugin-note-box plugin-warn" role="status">
-    <strong>{{ unreadable_count }} server(s) could not be read.</strong>
-    A server needs an admin credential before its plugins can be listed or installed &mdash; add one
-    on the Servers page. An unreadable server is never counted as &ldquo;has no plugins&rdquo;,
-    because that would offer to install something that may already be there.
+    <div>
+        <strong>{{ unreadable_count }} server(s) could not be read.</strong>
+        Plugin endpoints need administrator rights, which is a separate credential from the user
+        mapping that serves libraries &mdash; so this failing does not affect browsing or playback.
+        <ul class="plugin-reasons">
+            {% for server in servers %}{% if server.unreadable %}
+            <li><strong>{{ server.name }}</strong>: {{ server.error }}</li>
+            {% endif %}{% endfor %}
+        </ul>
+        An unreadable server is never counted as &ldquo;has no plugins&rdquo;, because that would
+        offer to install something that may already be there.
+    </div>
 </article>
 {% endif %}
 
@@ -154,6 +162,8 @@
     .plugin-note-box form { margin: 0; }
     .plugin-note-box button { margin: 0; white-space: nowrap; }
     .plugin-note { font-size: 0.85rem; opacity: 0.8; }
+    .plugin-reasons { margin: 0.5rem 0; padding-left: 1.2rem; font-size: 0.9rem; }
+    .plugin-reasons li { margin: 0.2rem 0; }
 
     .plugin-target-list { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.5rem 0 1.5rem; }
     .plugin-target { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.75rem;
