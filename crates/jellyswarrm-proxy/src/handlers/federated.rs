@@ -245,11 +245,33 @@ async fn get_interleaved_root(
     )
     .await?;
     let server_count = server_items.len();
+
+    // Sum the upstream totals rather than letting the reported count default to the size of the
+    // fetched window. Reporting the window size tells a paging client it has already seen
+    // everything, so anything that pages rather than scrolls — `/LiveTv/Channels`, `/LiveTv/Programs`,
+    // API and sync consumers — silently stopped after the first page. If any server answered with a
+    // bare array carrying no count, the true total is unknowable and we leave the existing
+    // behaviour alone rather than reporting a number we cannot stand behind.
+    let mut upstream_total = Some(0usize);
+    for fetched in &server_items {
+        match fetched.upstream_total {
+            Some(total) => {
+                if let Some(sum) = upstream_total.as_mut() {
+                    *sum += total.max(0) as usize;
+                }
+            }
+            None => upstream_total = None,
+        }
+    }
+
     let responses = server_items
         .into_iter()
         .map(|items| items.server_items.response)
         .collect::<Vec<_>>();
-    let items = FederatedItems::interleaved(responses);
+    let mut items = FederatedItems::interleaved(responses);
+    if let Some(total) = upstream_total {
+        items = items.with_reported_total(total);
+    }
 
     debug!("Combined items from {server_count} servers");
 

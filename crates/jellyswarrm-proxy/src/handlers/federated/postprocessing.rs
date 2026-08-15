@@ -636,4 +636,37 @@ mod tests {
 
         assert_eq!(required_sort_fields(&url), vec!["DateCreated"]);
     }
+
+    /// Interleaved responses previously reported `TotalRecordCount` as the size of the fetched
+    /// window. A paging client reads that as "you have seen everything", so anything that pages
+    /// rather than scrolls stopped after the first page.
+    #[test]
+    fn interleaved_results_can_report_a_total_larger_than_the_window() {
+        let url = url::Url::parse("http://localhost/Items").unwrap();
+
+        let windowed =
+            FederatedItems::new(vec![named_media_item("a", "A"), named_media_item("b", "B")])
+                .into_response(&url, ResponseShape::Counted);
+
+        match windowed {
+            ItemsResponseVariants::WithCount(response) => assert_eq!(
+                response.total_record_count, 2,
+                "without an explicit total the window size is reported"
+            ),
+            ItemsResponseVariants::Bare(_) => panic!("expected the counted shape"),
+        }
+
+        let with_total =
+            FederatedItems::new(vec![named_media_item("a", "A"), named_media_item("b", "B")])
+                .with_reported_total(57)
+                .into_response(&url, ResponseShape::Counted);
+
+        match with_total {
+            ItemsResponseVariants::WithCount(response) => assert_eq!(
+                response.total_record_count, 57,
+                "the summed upstream total must survive to the client"
+            ),
+            ItemsResponseVariants::Bare(_) => panic!("expected the counted shape"),
+        }
+    }
 }
