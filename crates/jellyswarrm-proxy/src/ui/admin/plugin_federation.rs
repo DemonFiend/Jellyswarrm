@@ -30,6 +30,7 @@ pub struct PluginFederationTemplate {
     pub mode_proxy: bool,
     pub tabs: Vec<ProxyCustomTab>,
     pub plugin_asset_prefixes: String,
+    pub plugin_api_prefixes: String,
     pub single_source_section_prefixes: String,
     pub library_view_sections: String,
     pub message: String,
@@ -59,6 +60,7 @@ pub struct FederationForm {
     pub mode: CustomTabsMode,
     pub tabs: Vec<ProxyCustomTab>,
     pub plugin_asset_prefixes: Vec<String>,
+    pub plugin_api_prefixes: Vec<String>,
     pub single_source_section_prefixes: Vec<String>,
     pub library_view_sections: Vec<String>,
 }
@@ -77,6 +79,7 @@ pub fn parse_federation_form(body: &str) -> FederationForm {
     let mut titles: Vec<String> = Vec::new();
     let mut bodies: Vec<String> = Vec::new();
     let mut plugin_asset_prefixes = Vec::new();
+    let mut plugin_api_prefixes = Vec::new();
     let mut single_source_section_prefixes = Vec::new();
     let mut library_view_sections = Vec::new();
 
@@ -94,6 +97,7 @@ pub fn parse_federation_form(body: &str) -> FederationForm {
             "tab_title" => titles.push(value.trim().to_string()),
             "tab_html" => bodies.push(value.into_owned()),
             "plugin_asset_prefixes" => plugin_asset_prefixes = parse_lines(&value),
+            "plugin_api_prefixes" => plugin_api_prefixes = parse_lines(&value),
             "single_source_section_prefixes" => {
                 single_source_section_prefixes = parse_lines(&value)
             }
@@ -116,6 +120,7 @@ pub fn parse_federation_form(body: &str) -> FederationForm {
         mode,
         tabs,
         plugin_asset_prefixes,
+        plugin_api_prefixes,
         single_source_section_prefixes,
         library_view_sections,
     }
@@ -144,6 +149,7 @@ async fn render(state: &AppState, message: String) -> Response {
         mode_proxy: federation.custom_tabs_mode == CustomTabsMode::Proxy,
         tabs,
         plugin_asset_prefixes: join_lines(&federation.plugin_asset_prefixes),
+        plugin_api_prefixes: join_lines(&federation.plugin_api_prefixes),
         single_source_section_prefixes: join_lines(&federation.single_source_section_prefixes),
         library_view_sections: join_lines(&federation.library_view_sections),
         message,
@@ -183,6 +189,7 @@ pub async fn save_federation(State(state): State<AppState>, body: String) -> Res
         updated.plugin_federation.custom_tabs_mode = form.mode;
         updated.plugin_federation.custom_tabs = form.tabs;
         updated.plugin_federation.plugin_asset_prefixes = form.plugin_asset_prefixes;
+        updated.plugin_federation.plugin_api_prefixes = form.plugin_api_prefixes;
         updated.plugin_federation.single_source_section_prefixes =
             form.single_source_section_prefixes;
         updated.plugin_federation.library_view_sections = form.library_view_sections;
@@ -297,6 +304,33 @@ mod tests {
         );
         assert_eq!(parse_lines("  \n\n /OnlyOne \n "), vec!["/OnlyOne"]);
         assert!(parse_lines("   ").is_empty());
+    }
+
+    /// The two route lists do different things and must not be conflated: assets are relayed
+    /// verbatim, API routes go through normal processing so the token is remapped.
+    #[test]
+    fn the_two_route_lists_are_parsed_independently() {
+        let form = parse_federation_form(
+            "plugin_asset_prefixes=%2FMediaBar&plugin_api_prefixes=%2FJellyfinEnhanced%0A%2FJellyTweaks",
+        );
+
+        assert_eq!(form.plugin_asset_prefixes, vec!["/MediaBar"]);
+        assert_eq!(
+            form.plugin_api_prefixes,
+            vec!["/JellyfinEnhanced", "/JellyTweaks"]
+        );
+    }
+
+    /// Jellyfin Enhanced identifies the caller from the access token, so an unpinned request
+    /// reaches an arbitrary server and is rejected. Shipping it as a default means an operator does
+    /// not have to diagnose that themselves.
+    #[test]
+    fn jellyfin_enhanced_is_pinned_by_default() {
+        let defaults = crate::config::PluginFederationConfig::default();
+        assert!(defaults
+            .plugin_api_prefixes
+            .iter()
+            .any(|prefix| prefix == "/JellyfinEnhanced"));
     }
 
     /// Windows browsers submit CRLF in textareas; a stray `\r` on every entry would break the

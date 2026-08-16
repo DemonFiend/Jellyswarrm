@@ -542,6 +542,43 @@ pub async fn remap_authorization(
     debug!("Remapped authorization to: {:?}", remapped_session);
     Ok(remapped_session)
 }
+/// The configured server whose web client the browser is running, if one matches.
+///
+/// `web_client_host` is a URL rather than a server reference, so it is matched back to a configured
+/// server by address. A host that is not a configured server — a dedicated plugin host, say — has
+/// no session to authenticate with, so pinning cannot apply and resolution falls through.
+async fn web_client_server(state: &AppState) -> Option<Server> {
+    let host = crate::handlers::web_client::configured_host(state).await?;
+    let servers = state.server_storage.list_servers().await.ok()?;
+    servers.into_iter().find(|server| {
+        server
+            .url
+            .as_str()
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(&host)
+    })
+}
+
+/// Whether this request is a plugin API call that must be pinned to the web client's server.
+///
+/// A client-side plugin's script is injected by one server and calls back to that plugin's own
+/// endpoints. Resolving those per request sends them to whichever server the resolver picks, which
+/// may not run the plugin — the visible result is a scatter of 400s and 404s that only appear
+/// through the proxy, because a direct connection has no resolution step at all.
+async fn pinned_plugin_api_server(state: &AppState, request: &reqwest::Request) -> Option<Server> {
+    let prefixes = {
+        let config = state.config.read().await;
+        config.plugin_federation.plugin_api_prefixes.clone()
+    };
+    if prefixes.is_empty() {
+        return None;
+    }
+    if !crate::handlers::web_client::is_plugin_asset_path(request.url().path(), &prefixes) {
+        return None;
+    }
+    web_client_server(state).await
+}
+
 pub async fn resolve_server(
     sessions: &Option<Vec<(AuthorizationSession, Server)>>,
     request_body_result: &Option<RequestBodyAnalysisResult>,
@@ -549,6 +586,29 @@ pub async fn resolve_server(
     request: &reqwest::Request,
     access_scope: Option<&VirtualLibraryAccessScope>,
 ) -> Result<(Server, Option<AuthorizationSession>, bool)> {
+    // Checked before anything else: a plugin API route carries no media ids to resolve from, so
+    // every other branch below would fall through to "first session by priority" and answer from an
+    // arbitrary server. Returning here still leaves the request on the normal path, so its token is
+    // remapped and its ids rewritten — which is the difference between this and relaying it as an
+    // asset.
+    if let Some(pinned) = pinned_plugin_api_server(state, request).await {
+        if let Some(sessions) = sessions {
+            if let Some((session, server)) = sessions.iter().find(|(_, s)| s.id == pinned.id) {
+                debug!("Pinning plugin API request to {}", server.url);
+                return Ok((server.clone(), Some(session.clone()), true));
+            }
+            // The user has no session on that server, so there is no token to send. Falling through
+            // is better than sending an unauthenticated request the plugin will reject.
+            debug!(
+                "Plugin API request should be pinned to {} but the user has no session there",
+                pinned.url
+            );
+        } else {
+            debug!("Pinning unauthenticated plugin API request to {}", pinned.url);
+            return Ok((pinned, None, true));
+        }
+    }
+
     let mut request_server = server_from_request_media_ids(state, request, access_scope).await?;
 
     if request_server.is_none() {

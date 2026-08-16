@@ -54,6 +54,18 @@
       </small>
     </label>
 
+    <label>Plugin API routes
+      <textarea name="plugin_api_prefixes" rows="3">{{ plugin_api_prefixes }}</textarea>
+      <small>
+        Routes belonging to a plugin's own backend &mdash; its settings, caches and integrations.
+        These are sent to the server serving your web client, <em>signed in as you</em>. Without this
+        they go to whichever server a request resolves to, which may not run the plugin at all, and
+        you get scattered 400s and 404s that only happen through Jellyswarrm. Add a prefix here when
+        a plugin talks to its own server-side API &mdash; unlike the list above, this works for any
+        prefix without needing anything else configured.
+      </small>
+    </label>
+
     <label>Single-source home sections
       <textarea name="single_source_section_prefixes" rows="4">{{ single_source_section_prefixes }}</textarea>
       <small>
