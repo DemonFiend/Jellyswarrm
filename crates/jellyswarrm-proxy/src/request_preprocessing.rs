@@ -276,9 +276,23 @@ pub async fn extract_request_infos(
     let sessions = if auth.is_none() {
         None
     } else if let Some(user) = &user {
+        // `Authorization: MediaBrowser Token="…"` is a valid Jellyfin header that carries no
+        // device at all, and several plugins send exactly that for their own API calls. Filtering
+        // a user's sessions by an absent device matches nothing, so the request ends up with no
+        // session and therefore no upstream token — it is forwarded unauthenticated and rejected,
+        // while every call the same client makes through jellyfin-web's ApiClient succeeds.
+        // Without a device to narrow by, every session the user has is the honest answer; they are
+        // ordered by server priority, and a pinned route picks the one it needs.
+        let device_filter = device.clone().filter(|device| {
+            Device::has_known_device_id(device.device_id.trim()) || !device.device.trim().is_empty()
+        });
+        if device.is_some() && device_filter.is_none() {
+            debug!("Authorization carries no device; matching on the user alone");
+        }
+
         let mut sessions = state
             .user_authorization
-            .get_user_sessions(&user.id, device.clone())
+            .get_user_sessions(&user.id, device_filter)
             .await?;
 
         // ANDROID TV DEVICE-ID REBIND (intentional behavior):

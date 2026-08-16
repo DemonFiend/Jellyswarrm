@@ -57,7 +57,18 @@ impl Authorization {
             }
         }
 
-        if client.is_empty() || device.is_empty() || device_id.is_empty() || version.is_empty() {
+        // Jellyfin accepts `MediaBrowser Token="…"` on its own — the descriptive fields identify a
+        // device, they do not authenticate one — and plugins use exactly that form for their own
+        // API calls. Requiring all four rejected those headers, so the proxy saw the request as
+        // anonymous: no user, therefore no session, therefore no upstream token to swap in, and it
+        // was forwarded bare to be rejected. The symptom is a plugin whose endpoints 401 only
+        // through the proxy while every call the same client makes via jellyfin-web succeeds.
+        //
+        // A token is sufficient on its own. Without one the descriptive fields are all there is,
+        // and an incomplete set is still worth rejecting rather than guessing at.
+        if token.is_none()
+            && (client.is_empty() || device.is_empty() || device_id.is_empty() || version.is_empty())
+        {
             return Err("Missing required authorization parameters".to_string());
         }
 
@@ -191,6 +202,44 @@ impl fmt::Display for Authorization {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Jellyfin accepts a bare token, and plugins send exactly this for their own API calls.
+    /// Rejecting it made the proxy treat the request as anonymous, so it had no session to swap
+    /// the token for and forwarded it unauthenticated — a 401 that only happens through the proxy.
+    #[test]
+    fn a_token_only_header_is_accepted() {
+        let auth = Authorization::parse(r#"MediaBrowser Token="abc123""#)
+            .expect("a bare token is a valid Jellyfin authorization");
+
+        assert_eq!(auth.token.as_deref(), Some("abc123"));
+        assert_eq!(auth.client, "");
+        assert_eq!(auth.device_id, "");
+    }
+
+    /// The descriptive fields identify a device; they do not authenticate one. A token plus a
+    /// partial set is still usable.
+    #[test]
+    fn a_token_with_only_some_fields_is_accepted() {
+        let auth = Authorization::parse(r#"MediaBrowser Client="Plugin", Token="abc123""#)
+            .expect("a token with partial device information is usable");
+
+        assert_eq!(auth.token.as_deref(), Some("abc123"));
+        assert_eq!(auth.client, "Plugin");
+    }
+
+    /// Without a token the descriptive fields are all there is, so an incomplete set is still
+    /// worth rejecting rather than guessing at.
+    #[test]
+    fn an_incomplete_header_without_a_token_is_still_rejected() {
+        assert!(Authorization::parse(r#"MediaBrowser Client="Jellyfin Web""#).is_err());
+        assert!(Authorization::parse(r#"MediaBrowser Client="A", Device="B""#).is_err());
+    }
+
+    /// An empty token is not a token, so the strict check still applies.
+    #[test]
+    fn an_empty_token_does_not_count_as_authentication() {
+        assert!(Authorization::parse(r#"MediaBrowser Token="""#).is_err());
+    }
 
     #[test]
     fn test_parse_authorization() {
