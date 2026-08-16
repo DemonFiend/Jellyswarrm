@@ -138,6 +138,8 @@ impl UrlProcessor {
                 *url = replace_id(url.clone(), &user_id, &session.original_user_id);
             }
         }
+
+        replace_proxy_user_id_in_path(url, session);
     }
 
     async fn replace_media_ids_in_path(
@@ -518,6 +520,48 @@ fn relative_url_from_parts(url: &url::Url) -> String {
     value
 }
 
+/// Replace the proxy's own user id wherever it appears as a path segment.
+///
+/// `USER_ID_PATH_TAGS` finds a user id by the segment in front of it, which only works for paths
+/// Jellyfin defines. A plugin addresses its own endpoints however it likes — Jellyfin Enhanced uses
+/// `/JellyfinEnhanced/user-settings/{id}/settings.json` and `/JellyfinEnhanced/tag-cache/{id}` —
+/// so no list of leading segments can cover them, and extending that list per plugin would put
+/// plugin trivia in the routing layer.
+///
+/// The id itself is the reliable marker. The proxy's user id is meaningless upstream, so a segment
+/// equal to it is always one the client took from a proxied response and always wants translating.
+/// Matching one known value rather than guessing which segments look like ids also means paths that
+/// merely contain an id-shaped segment are untouched. Left in place, the upstream sees one user's
+/// id presented with another user's token and answers 403 — the settings a plugin cannot save.
+fn replace_proxy_user_id_in_path(url: &mut url::Url, session: &AuthorizationSession) {
+    let Some(segments) = url.path_segments() else {
+        return;
+    };
+    let segments: Vec<String> = segments.map(str::to_string).collect();
+    if !segments.contains(&session.user_id) {
+        return;
+    }
+
+    debug!(
+        "Replacing proxy user ID in path: {} -> {}",
+        session.user_id, session.original_user_id
+    );
+    let rewritten: Vec<&str> = segments
+        .iter()
+        .map(|segment| {
+            if *segment == session.user_id {
+                session.original_user_id.as_str()
+            } else {
+                segment.as_str()
+            }
+        })
+        .collect();
+
+    if let Ok(mut path) = url.path_segments_mut() {
+        path.clear().extend(rewritten);
+    }
+}
+
 pub fn matches_case_insensitive(value: &str, candidates: &[&str]) -> bool {
     candidates
         .iter()
@@ -536,7 +580,7 @@ mod tests {
         media_storage_service::MediaStorageService,
         server_storage::ServerStorageService,
         session_storage::SessionStorage,
-        user_authorization_service::UserAuthorizationService,
+        user_authorization_service::{Device, UserAuthorizationService},
         virtual_library_service::VirtualLibraryService,
     };
 
@@ -875,5 +919,95 @@ mod tests {
                 .await;
             assert_eq!(url.path(), path, "{path} must pass through untouched");
         }
+    }
+
+    fn proxy_session() -> AuthorizationSession {
+        AuthorizationSession {
+            id: 1,
+            user_id: "b48bad6ec9f742b8a9cab1cb4e257049".to_string(),
+            mapping_id: 1,
+            server_url: "http://server.example".to_string(),
+            device: Device {
+                client: "Jellyfin Media Player".to_string(),
+                device: "Gaming".to_string(),
+                device_id: "device-id".to_string(),
+                version: "1.12.0".to_string(),
+            },
+            jellyfin_token: "token".to_string(),
+            original_user_id: "e44d0fcbabb0453aa24f57d461b986ae".to_string(),
+            expires_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    async fn path_through_proxy(path: &str, session: &Option<AuthorizationSession>) -> String {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let server_storage = ServerStorageService::new(pool.clone());
+        let media_storage = MediaStorageService::new(pool.clone());
+        let virtual_libraries =
+            VirtualLibraryService::new(pool.clone(), server_storage.clone(), media_storage.clone());
+        let processor = UrlProcessor::new(DataContext {
+            user_authorization: Arc::new(UserAuthorizationService::new(pool)),
+            server_storage: Arc::new(server_storage),
+            media_storage: Arc::new(media_storage),
+            virtual_library_service: Arc::new(virtual_libraries),
+            play_sessions: Arc::new(SessionStorage::new()),
+            config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),
+        });
+
+        let mut url = url::Url::parse(&format!("http://localhost{path}")).unwrap();
+        processor
+            .client_to_server_url(&mut url, session, None, None)
+            .await;
+        url.path().to_string()
+    }
+
+    /// A plugin routes its own endpoints however it likes, so `USER_ID_PATH_TAGS` — which finds a
+    /// user id by the segment in front of it — never sees these. Jellyfin Enhanced keeps its
+    /// per-user state behind exactly such paths, and an unreplaced proxy id arrives upstream as one
+    /// user's id carried by another user's token, which Jellyfin answers 403: settings that will
+    /// not save and tags that keep reverting.
+    #[tokio::test]
+    async fn a_plugin_path_carrying_the_proxy_user_id_is_remapped() {
+        let session = Some(proxy_session());
+
+        for (path, expected) in [
+            (
+                "/JellyfinEnhanced/user-settings/b48bad6ec9f742b8a9cab1cb4e257049/settings.json",
+                "/JellyfinEnhanced/user-settings/e44d0fcbabb0453aa24f57d461b986ae/settings.json",
+            ),
+            (
+                "/JellyfinEnhanced/tag-cache/b48bad6ec9f742b8a9cab1cb4e257049",
+                "/JellyfinEnhanced/tag-cache/e44d0fcbabb0453aa24f57d461b986ae",
+            ),
+        ] {
+            assert_eq!(path_through_proxy(path, &session).await, expected);
+        }
+    }
+
+    /// Only the requesting user's own proxy id is replaced. Another id-shaped segment belongs to the
+    /// plugin's own data, and guessing that any id in an unknown path is a user reference would
+    /// corrupt it.
+    #[tokio::test]
+    async fn a_plugin_path_without_the_proxy_user_id_is_untouched() {
+        let path = "/JellyfinEnhanced/tag-cache/0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            path_through_proxy(path, &Some(proxy_session())).await,
+            path,
+            "an id that is not this user's must pass through untouched"
+        );
+    }
+
+    /// The user id a proxied response hands back is the proxy's, so a client can legitimately place
+    /// it anywhere a plugin's API expects a user — including the last segment, and more than once.
+    #[tokio::test]
+    async fn every_occurrence_of_the_proxy_user_id_is_replaced() {
+        let path = "/JellyTweaks/b48bad6ec9f742b8a9cab1cb4e257049/peers/b48bad6ec9f742b8a9cab1cb4e257049";
+        assert_eq!(
+            path_through_proxy(path, &Some(proxy_session())).await,
+            "/JellyTweaks/e44d0fcbabb0453aa24f57d461b986ae/peers/e44d0fcbabb0453aa24f57d461b986ae"
+        );
     }
 }
