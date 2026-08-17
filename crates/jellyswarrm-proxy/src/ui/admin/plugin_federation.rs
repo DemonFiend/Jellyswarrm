@@ -31,6 +31,7 @@ pub struct PluginFederationTemplate {
     pub tabs: Vec<ProxyCustomTab>,
     pub plugin_asset_prefixes: String,
     pub plugin_api_prefixes: String,
+    pub federated_plugin_api_prefixes: String,
     pub single_source_section_prefixes: String,
     pub library_view_sections: String,
     pub message: String,
@@ -61,6 +62,7 @@ pub struct FederationForm {
     pub tabs: Vec<ProxyCustomTab>,
     pub plugin_asset_prefixes: Vec<String>,
     pub plugin_api_prefixes: Vec<String>,
+    pub federated_plugin_api_prefixes: Vec<String>,
     pub single_source_section_prefixes: Vec<String>,
     pub library_view_sections: Vec<String>,
 }
@@ -80,6 +82,7 @@ pub fn parse_federation_form(body: &str) -> FederationForm {
     let mut bodies: Vec<String> = Vec::new();
     let mut plugin_asset_prefixes = Vec::new();
     let mut plugin_api_prefixes = Vec::new();
+    let mut federated_plugin_api_prefixes = Vec::new();
     let mut single_source_section_prefixes = Vec::new();
     let mut library_view_sections = Vec::new();
 
@@ -98,6 +101,7 @@ pub fn parse_federation_form(body: &str) -> FederationForm {
             "tab_html" => bodies.push(value.into_owned()),
             "plugin_asset_prefixes" => plugin_asset_prefixes = parse_lines(&value),
             "plugin_api_prefixes" => plugin_api_prefixes = parse_lines(&value),
+            "federated_plugin_api_prefixes" => federated_plugin_api_prefixes = parse_lines(&value),
             "single_source_section_prefixes" => {
                 single_source_section_prefixes = parse_lines(&value)
             }
@@ -121,6 +125,7 @@ pub fn parse_federation_form(body: &str) -> FederationForm {
         tabs,
         plugin_asset_prefixes,
         plugin_api_prefixes,
+        federated_plugin_api_prefixes,
         single_source_section_prefixes,
         library_view_sections,
     }
@@ -150,6 +155,7 @@ async fn render(state: &AppState, message: String) -> Response {
         tabs,
         plugin_asset_prefixes: join_lines(&federation.plugin_asset_prefixes),
         plugin_api_prefixes: join_lines(&federation.plugin_api_prefixes),
+        federated_plugin_api_prefixes: join_lines(&federation.federated_plugin_api_prefixes),
         single_source_section_prefixes: join_lines(&federation.single_source_section_prefixes),
         library_view_sections: join_lines(&federation.library_view_sections),
         message,
@@ -190,6 +196,8 @@ pub async fn save_federation(State(state): State<AppState>, body: String) -> Res
         updated.plugin_federation.custom_tabs = form.tabs;
         updated.plugin_federation.plugin_asset_prefixes = form.plugin_asset_prefixes;
         updated.plugin_federation.plugin_api_prefixes = form.plugin_api_prefixes;
+        updated.plugin_federation.federated_plugin_api_prefixes =
+            form.federated_plugin_api_prefixes;
         updated.plugin_federation.single_source_section_prefixes =
             form.single_source_section_prefixes;
         updated.plugin_federation.library_view_sections = form.library_view_sections;
@@ -319,6 +327,34 @@ mod tests {
             form.plugin_api_prefixes,
             vec!["/JellyfinEnhanced", "/JellyTweaks"]
         );
+    }
+
+    /// The merged list carves exceptions out of the pinned one, so both arrive together and the
+    /// longer entries must survive as their own list rather than folding into the prefix that pins
+    /// them.
+    #[test]
+    fn merged_routes_are_parsed_separately_from_pinned_ones() {
+        let form = parse_federation_form(
+            "plugin_api_prefixes=%2FJellyfinEnhanced&federated_plugin_api_prefixes=%2FJellyfinEnhanced%2Ftag-cache%0A%2FJellyfinEnhanced%2Ftag-data",
+        );
+
+        assert_eq!(form.plugin_api_prefixes, vec!["/JellyfinEnhanced"]);
+        assert_eq!(
+            form.federated_plugin_api_prefixes,
+            vec!["/JellyfinEnhanced/tag-cache", "/JellyfinEnhanced/tag-data"]
+        );
+    }
+
+    /// A plugin's tag cache only covers the library of the server holding it, so pinning it leaves
+    /// every item from every other server unbadged. Shipping the exception as a default spares an
+    /// operator diagnosing a half-tagged library.
+    #[test]
+    fn enhanced_tag_routes_are_merged_by_default() {
+        let defaults = crate::config::PluginFederationConfig::default();
+        assert!(defaults
+            .federated_plugin_api_prefixes
+            .iter()
+            .any(|prefix| prefix == "/JellyfinEnhanced/tag-cache"));
     }
 
     /// Jellyfin Enhanced identifies the caller from the access token, so an unpinned request

@@ -348,6 +348,24 @@ fn default_plugin_api_prefixes() -> Vec<String> {
         .collect()
 }
 
+/// Plugin routes answering about *items* rather than about the server or the user.
+///
+/// Pinning sends every plugin call to the one server that injected the script, which is right for
+/// anything describing that plugin or that user — its version, its settings — and wrong for
+/// anything describing the library, because each server only knows its own. Jellyfin Enhanced's
+/// tag cache is the case in point: pinned, half a merged library gets no quality or rating badge,
+/// since the pinned server has never heard of the other server's items.
+///
+/// A prefix listed here is asked of every server the user has a session on and the answers merged.
+/// Being a subset of [`default_plugin_api_prefixes`], the entries must be longer than the prefix
+/// that pins them, so ordering matters to whoever edits the list: federation is checked first.
+fn default_federated_plugin_api_prefixes() -> Vec<String> {
+    ["/JellyfinEnhanced/tag-cache", "/JellyfinEnhanced/tag-data"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Home screen sections whose content comes from an external service rather than the local library,
 /// matched as normalised prefixes because the plugin names variants by suffix.
 fn default_single_source_section_prefixes() -> Vec<String> {
@@ -383,6 +401,9 @@ pub struct PluginFederationConfig {
 
     #[serde(default = "default_plugin_api_prefixes")]
     pub plugin_api_prefixes: Vec<String>,
+
+    #[serde(default = "default_federated_plugin_api_prefixes")]
+    pub federated_plugin_api_prefixes: Vec<String>,
 
     #[serde(default = "default_single_source_section_prefixes")]
     pub single_source_section_prefixes: Vec<String>,

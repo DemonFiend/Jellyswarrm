@@ -66,6 +66,19 @@
       </small>
     </label>
 
+    <label>Merged plugin API routes
+      <textarea name="federated_plugin_api_prefixes" rows="3">{{ federated_plugin_api_prefixes }}</textarea>
+      <small>
+        The exceptions to the list above: routes that answer about <em>items</em> rather than about
+        the plugin or about you. These are asked of every server you are signed in to and the
+        answers merged, because each server only knows its own library. Jellyfin Enhanced's tag
+        cache is the example &mdash; pinned to one server, everything from the others shows no
+        quality or rating badge. Entries must be longer than the prefix that pins them, and only
+        belong here if merging two servers' answers makes sense; a user's settings, for instance,
+        do not.
+      </small>
+    </label>
+
     <label>Single-source home sections
       <textarea name="single_source_section_prefixes" rows="4">{{ single_source_section_prefixes }}</textarea>
       <small>

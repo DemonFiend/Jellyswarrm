@@ -995,6 +995,23 @@ async fn proxy_handler(
         StatusCode::BAD_REQUEST
     })?;
 
+    // A plugin route answering about items belongs to every server, not to the one that injected
+    // the script, so it is merged before the single-server path below can pin it.
+    if let Some(merged) = handlers::plugin_data::merged_plugin_data(&state, &preprocessed).await {
+        let body = serde_json::to_vec(&merged?).map_err(|e| {
+            error!("Failed to serialize merged plugin data: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        return Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, body.len().to_string())
+            .body(Body::from(body))
+            .map_err(|e| {
+                error!("Failed to build merged plugin data response: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            });
+    }
+
     let request_url = preprocessed.request.url().clone();
     let response_server = preprocessed.server.clone();
     let response_proxy_api_key = preprocessed

@@ -6,6 +6,7 @@ pub(crate) mod federated;
 pub(crate) mod home_screen;
 pub(crate) mod items;
 pub(crate) mod livestreams;
+pub(crate) mod plugin_data;
 pub(crate) mod quick_connect;
 pub(crate) mod remote_control;
 pub(crate) mod syncplay;
