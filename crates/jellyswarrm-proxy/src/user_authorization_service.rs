@@ -1974,13 +1974,15 @@ mod tests {
         let old = Device {
             client: "Jellyfin Media Player".to_string(),
             device: "Sosia-Main".to_string(),
-            device_id: "SmVsbHlmaW5NZWRpYVBsYXllciAxLjEyLjAgKHdpbmRvd3MteDg2XzY0IDEwKXwxNzQ0NTY4Mjk1OTgw"
-                .to_string(),
+            device_id:
+                "SmVsbHlmaW5NZWRpYVBsYXllciAxLjEyLjAgKHdpbmRvd3MteDg2XzY0IDEwKXwxNzQ0NTY4Mjk1OTgw"
+                    .to_string(),
             version: "1.12.0".to_string(),
         };
         let current = Device {
-            device_id: "SmVsbHlmaW5NZWRpYVBsYXllciAxLjEyLjAgKHdpbmRvd3MteDg2XzY0IDEwKXwxNzgxNDE2MzYwNjMz"
-                .to_string(),
+            device_id:
+                "SmVsbHlmaW5NZWRpYVBsYXllciAxLjEyLjAgKHdpbmRvd3MteDg2XzY0IDEwKXwxNzgxNDE2MzYwNjMz"
+                    .to_string(),
             ..old.clone()
         };
 

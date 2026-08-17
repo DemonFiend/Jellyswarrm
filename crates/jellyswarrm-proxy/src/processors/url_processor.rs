@@ -1004,7 +1004,8 @@ mod tests {
     /// it anywhere a plugin's API expects a user — including the last segment, and more than once.
     #[tokio::test]
     async fn every_occurrence_of_the_proxy_user_id_is_replaced() {
-        let path = "/JellyTweaks/b48bad6ec9f742b8a9cab1cb4e257049/peers/b48bad6ec9f742b8a9cab1cb4e257049";
+        let path =
+            "/JellyTweaks/b48bad6ec9f742b8a9cab1cb4e257049/peers/b48bad6ec9f742b8a9cab1cb4e257049";
         assert_eq!(
             path_through_proxy(path, &Some(proxy_session())).await,
             "/JellyTweaks/e44d0fcbabb0453aa24f57d461b986ae/peers/e44d0fcbabb0453aa24f57d461b986ae"

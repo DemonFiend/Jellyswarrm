@@ -618,7 +618,10 @@ pub async fn resolve_server(
                 pinned.url
             );
         } else {
-            debug!("Pinning unauthenticated plugin API request to {}", pinned.url);
+            debug!(
+                "Pinning unauthenticated plugin API request to {}",
+                pinned.url
+            );
             return Ok((pinned, None, true));
         }
     }

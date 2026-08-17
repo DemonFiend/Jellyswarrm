@@ -250,7 +250,10 @@ mod tests {
         assert!(is_plugin_asset_path("/mediabar/webconfig", &p));
         assert!(is_plugin_asset_path("/PluginPages/inject.js", &p));
         assert!(is_plugin_asset_path("/CustomTabs/Config", &p));
-        assert!(is_plugin_asset_path("/HomeScreen/home-screen-sections.js", &p));
+        assert!(is_plugin_asset_path(
+            "/HomeScreen/home-screen-sections.js",
+            &p
+        ));
 
         // A prefix that merely starts with the same letters is a different route.
         assert!(!is_plugin_asset_path("/MediaBarSomethingElse", &p));
@@ -280,7 +283,10 @@ mod tests {
             .filter(|p| p != "/MediaBar")
             .collect();
 
-        assert!(!is_plugin_asset_path("/MediaBar/WebConfig", &without_mediabar));
+        assert!(!is_plugin_asset_path(
+            "/MediaBar/WebConfig",
+            &without_mediabar
+        ));
         assert!(is_plugin_asset_path(
             "/CustomTabs/Config",
             &without_mediabar

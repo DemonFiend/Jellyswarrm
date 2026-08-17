@@ -95,7 +95,10 @@ async fn tabs_from_all_servers(state: &AppState) -> Vec<Vec<CustomTab>> {
     let mut legs = JoinSet::new();
     for (index, server) in servers.into_iter().enumerate() {
         let client = state.reqwest_client.clone();
-        let url = format!("{}/CustomTabs/config", server.url.as_str().trim_end_matches('/'));
+        let url = format!(
+            "{}/CustomTabs/config",
+            server.url.as_str().trim_end_matches('/')
+        );
         let name = server.name.clone();
         legs.spawn(async move {
             let request = client.get(&url).send();

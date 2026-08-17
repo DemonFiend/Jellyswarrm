@@ -67,7 +67,10 @@ impl Authorization {
         // A token is sufficient on its own. Without one the descriptive fields are all there is,
         // and an incomplete set is still worth rejecting rather than guessing at.
         if token.is_none()
-            && (client.is_empty() || device.is_empty() || device_id.is_empty() || version.is_empty())
+            && (client.is_empty()
+                || device.is_empty()
+                || device_id.is_empty()
+                || version.is_empty())
         {
             return Err("Missing required authorization parameters".to_string());
         }

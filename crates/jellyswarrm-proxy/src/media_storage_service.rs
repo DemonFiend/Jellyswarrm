@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 use tracing::{debug, error, info, trace};
@@ -142,6 +142,61 @@ impl MediaStorageService {
             Ok(uuid) => uuid.simple().to_string(),
             Err(_) => s.to_string(),
         }
+    }
+
+    /// Translate a batch of one server's own media ids to virtual ids, skipping any that the proxy
+    /// has never mapped.
+    ///
+    /// Unlike `get_or_create_media_mapping` this never mints a mapping. That is the point: callers
+    /// use it for ids that arrived somewhere the proxy cannot vouch for — a plugin's payload, keyed
+    /// however that plugin likes — where minting a mapping for every id-shaped string would fill
+    /// the table with whatever the plugin happened to send. An id that is already mapped is one the
+    /// proxy has served to this client under a virtual id, so translating it is safe; an id that is
+    /// not mapped cannot be on screen, so leaving it alone costs nothing.
+    ///
+    /// One query per chunk rather than one per id: these payloads run to five figures, and a
+    /// round trip each would put seconds on a request the client makes on every page load.
+    pub async fn virtual_ids_for_originals(
+        &self,
+        original_media_ids: &[String],
+        server_id: ServerId,
+    ) -> Result<HashMap<String, String>, sqlx::Error> {
+        let mut found = HashMap::new();
+        if original_media_ids.is_empty() {
+            return Ok(found);
+        }
+
+        // SQLite refuses a statement with more than 999 bound parameters by default.
+        for chunk in original_media_ids.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                r#"
+                SELECT virtual_media_id, original_media_id
+                FROM media_mappings
+                WHERE server_id = ? AND original_media_id IN ({placeholders})
+                "#
+            );
+
+            let mut query = sqlx::query(&sql).bind(server_id.as_i64());
+            for id in chunk {
+                query = query.bind(Self::normalize_uuid(id));
+            }
+
+            for row in query.fetch_all(&self.pool).await? {
+                found.insert(
+                    row.try_get::<String, _>("original_media_id")?,
+                    row.try_get::<String, _>("virtual_media_id")?,
+                );
+            }
+        }
+
+        debug!(
+            "Resolved {} of {} plugin media ids on server {}",
+            found.len(),
+            original_media_ids.len(),
+            server_id.as_i64()
+        );
+        Ok(found)
     }
 
     /// Get media mapping by virtual media ID

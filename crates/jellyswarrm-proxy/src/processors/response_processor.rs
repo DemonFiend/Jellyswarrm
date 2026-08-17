@@ -1,8 +1,11 @@
+use std::collections::{HashMap, HashSet};
+
 use async_trait::async_trait;
 use serde_json::{Map, Value};
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::{
+    media_storage_service::MediaStorageService,
     processors::{
         field_matcher::{
             DELIVERY_URL_FIELDS, DISABLED_BOOL_FIELDS, MEDIA_ID_ARRAY_FIELDS,
@@ -13,6 +16,7 @@ use crate::{
         url_processor::UrlProcessor,
     },
     server_storage::Server,
+    url_helper::is_id_like,
     DataContext,
 };
 
@@ -57,6 +61,10 @@ pub struct ResponseProcessingContext {
     pub profile: ResponseProcessingProfile,
     pub should_change_name: bool,
     pub can_change_item_names: bool,
+    /// Object keys in this payload that are known media ids of `server`, mapped to their virtual
+    /// ids. Resolved up front by [`media_id_object_keys`] because the ids appear as *keys*, and a
+    /// key can only be renamed by a caller that already knows what to rename it to.
+    pub media_id_object_keys: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +145,19 @@ impl JsonProcessor<ResponseProcessingContext> for ResponseProcessor {
             return result;
         }
 
+        if context.rewrites_media_fields() {
+            if let Some(virtual_id) = context
+                .media_id_object_keys
+                .get(&MediaStorageService::normalize_uuid(&json_context.key))
+            {
+                debug!(
+                    "Replacing plugin response object key media ID {} -> {}",
+                    json_context.key, virtual_id
+                );
+                return result.rename_key(virtual_id.clone());
+            }
+        }
+
         if context.rewrites_media_fields()
             && RESPONSE_MEDIA_ID_FIELDS.contains(&json_context.key)
             && !is_legacy_unmapped_media_id_field(json_context)
@@ -185,6 +206,61 @@ impl JsonProcessor<ResponseProcessingContext> for ResponseProcessor {
         }
 
         result
+    }
+}
+
+/// Resolve every object key in `payload` that is a known media id of `server`.
+///
+/// `MEDIA_ID_MAP_KEY_FIELDS` finds id-keyed maps by the field that encloses them, which works for
+/// the shapes Jellyfin defines and not at all for the ones a plugin invents. Jellyfin Enhanced
+/// keys its tag cache directly by item id, so its keys sit under no recognised field and survived
+/// untouched: five figures of entries in the upstream's id space, addressed by a page holding
+/// virtual ids, matching nothing and rendering no badges at all.
+///
+/// Recognition is by lookup rather than by shape. An id-shaped key is only a media id if the proxy
+/// has already mapped it for this server, and only then can it correspond to something on screen.
+/// Anything else — a plugin's own identifiers, a hash, an id belonging to another server — has no
+/// mapping and is left exactly as it is.
+pub async fn media_id_object_keys(
+    media_storage: &MediaStorageService,
+    payload: &serde_json::Value,
+    server: &Server,
+) -> HashMap<String, String> {
+    let mut candidates = HashSet::new();
+    collect_id_like_object_keys(payload, &mut candidates);
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+
+    let candidates: Vec<String> = candidates.into_iter().collect();
+    match media_storage
+        .virtual_ids_for_originals(&candidates, server.id)
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            error!("Failed to resolve media ids used as object keys: {e}");
+            HashMap::new()
+        }
+    }
+}
+
+fn collect_id_like_object_keys(value: &serde_json::Value, out: &mut HashSet<String>) {
+    match value {
+        Value::Object(entries) => {
+            for (key, child) in entries {
+                if is_id_like(key) {
+                    out.insert(MediaStorageService::normalize_uuid(key));
+                }
+                collect_id_like_object_keys(child, out);
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_id_like_object_keys(entry, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -266,4 +342,135 @@ fn path_segments(path: &str) -> impl Iterator<Item = &str> {
 
 fn strip_array_index(segment: &str) -> &str {
     segment.split('[').next().unwrap_or(segment)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use sqlx::SqlitePool;
+
+    use super::*;
+    use crate::{
+        config::{AppConfig, MediaStreamingMode, MIGRATOR},
+        server_storage::ServerStorageService,
+        session_storage::SessionStorage,
+        user_authorization_service::UserAuthorizationService,
+        virtual_library_service::VirtualLibraryService,
+    };
+
+    /// Runs `payload` through response processing against a server holding one already-mapped item,
+    /// returning the rewritten payload and that item's virtual id.
+    async fn process(payload: &mut Value, mapped_id: &str) -> String {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let server_storage = ServerStorageService::new(pool.clone());
+        let server_id = server_storage
+            .add_server(
+                "SGTV",
+                "http://sgtv.example",
+                100,
+                MediaStreamingMode::Redirect,
+            )
+            .await
+            .unwrap();
+        let server = server_storage
+            .get_server_by_id(server_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let media_storage = MediaStorageService::new(pool.clone());
+        let mapping = media_storage
+            .get_or_create_media_mapping(mapped_id, &server)
+            .await
+            .unwrap();
+        let virtual_libraries =
+            VirtualLibraryService::new(pool.clone(), server_storage.clone(), media_storage.clone());
+        let data_context = DataContext {
+            user_authorization: Arc::new(UserAuthorizationService::new(pool)),
+            server_storage: Arc::new(server_storage),
+            media_storage: Arc::new(media_storage),
+            virtual_library_service: Arc::new(virtual_libraries),
+            play_sessions: Arc::new(SessionStorage::new()),
+            config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),
+        };
+
+        let context = ResponseProcessingContext {
+            server: server.clone(),
+            proxy_server_id: "proxy".to_string(),
+            proxy_api_key: None,
+            profile: ResponseProcessingProfile::Media,
+            should_change_name: false,
+            can_change_item_names: false,
+            media_id_object_keys: media_id_object_keys(
+                &data_context.media_storage.clone(),
+                payload,
+                &server,
+            )
+            .await,
+        };
+
+        let processor = ResponseProcessor::new(data_context);
+        let processed =
+            crate::processors::json_processor::process_json(payload, &processor, &context)
+                .await
+                .unwrap();
+        *payload = processed.data;
+        mapping.virtual_media_id
+    }
+
+    /// Jellyfin Enhanced keys its tag cache directly by item id, under no field the proxy
+    /// recognises. Left in the upstream's id space the entries match nothing on a page built from
+    /// virtual ids, and every quality and rating badge silently fails to render.
+    #[tokio::test]
+    async fn media_ids_used_as_object_keys_are_remapped() {
+        let original = "11111111-1111-1111-1111-111111111111";
+        let mut payload = json!({
+            "version": 1,
+            "items": {
+                original.replace('-', ""): { "quality": "1080P", "rating": 7.4 },
+            },
+        });
+
+        let virtual_id = process(&mut payload, original).await;
+
+        let items = payload["items"].as_object().unwrap();
+        assert!(
+            items.contains_key(&virtual_id),
+            "the tag entry must be addressable by the id the page actually holds"
+        );
+        assert_eq!(items[&virtual_id]["quality"], "1080P");
+    }
+
+    /// Recognition is by lookup, not by shape: an id the proxy has never mapped cannot be on screen,
+    /// and may not even be a media id. Rewriting it — or minting a mapping to make one — would put
+    /// the plugin's own identifiers into the proxy's id space.
+    #[tokio::test]
+    async fn id_shaped_keys_without_a_mapping_are_left_alone() {
+        let unmapped = "22222222222222222222222222222222";
+        let mut payload = json!({ unmapped: { "quality": "4K" } });
+
+        process(&mut payload, "11111111-1111-1111-1111-111111111111").await;
+
+        assert!(
+            payload.as_object().unwrap().contains_key(unmapped),
+            "an unmapped id-shaped key must survive untouched"
+        );
+    }
+
+    /// A plugin is free to nest, so keying off the enclosing field is what failed in the first
+    /// place. Depth must not matter.
+    #[tokio::test]
+    async fn media_id_keys_are_remapped_at_any_depth() {
+        let original = "11111111-1111-1111-1111-111111111111";
+        let mut payload = json!({
+            "cache": { "byUser": [ { original.replace('-', ""): { "rating": 9.1 } } ] },
+        });
+
+        let virtual_id = process(&mut payload, original).await;
+
+        let nested = payload["cache"]["byUser"][0].as_object().unwrap();
+        assert!(nested.contains_key(&virtual_id));
+    }
 }

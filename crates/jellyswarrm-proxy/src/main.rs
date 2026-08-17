@@ -195,6 +195,12 @@ impl AppState {
             profile,
             should_change_name,
             can_change_item_names: self.can_change_item_names().await,
+            media_id_object_keys: processors::response_processor::media_id_object_keys(
+                &self.media_storage,
+                payload,
+                server,
+            )
+            .await,
         };
 
         self.processors

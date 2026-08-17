@@ -112,12 +112,19 @@ pub async fn get_home_screen_section(
     let (single_source_prefixes, library_view_sections) = {
         let config = state.config.read().await;
         (
-            config.plugin_federation.single_source_section_prefixes.clone(),
+            config
+                .plugin_federation
+                .single_source_section_prefixes
+                .clone(),
             config.plugin_federation.library_view_sections.clone(),
         )
     };
 
-    match sourcing_for(&sectiontype, &single_source_prefixes, &library_view_sections) {
+    match sourcing_for(
+        &sectiontype,
+        &single_source_prefixes,
+        &library_view_sections,
+    ) {
         SectionSourcing::Federated => {
             debug!("Federating home screen section '{sectiontype}' across all servers");
             get_items_from_all_servers_if_not_restricted(state, preprocessed).await
