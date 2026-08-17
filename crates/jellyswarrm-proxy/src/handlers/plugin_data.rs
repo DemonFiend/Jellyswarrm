@@ -12,6 +12,8 @@
 //! results are merged — by then the ids no longer collide, because they no longer belong to any one
 //! server.
 
+use std::collections::HashSet;
+
 use axum::http::StatusCode;
 use serde_json::{map::Entry, Value};
 use tokio::task::JoinSet;
@@ -63,7 +65,7 @@ pub async fn merged_plugin_data(
         return None;
     }
 
-    let sessions = preprocessed.sessions.as_ref()?;
+    let sessions = one_session_per_server(preprocessed.sessions.as_ref()?);
     if sessions.len() < 2 {
         return None;
     }
@@ -73,7 +75,26 @@ pub async fn merged_plugin_data(
         path,
         sessions.len()
     );
-    Some(fan_out(state, preprocessed, sessions).await)
+    Some(fan_out(state, preprocessed, &sessions).await)
+}
+
+/// One leg per server, rather than one per session.
+///
+/// A user accumulates a session per device per server, so this list routinely holds several entries
+/// for the same server — seven, for someone using a browser and a media player against two servers.
+/// Fanning out per session asks each server the same question several times, and these payloads run
+/// to five figures: the duplicate answers cost a multiple of the work to fetch, parse and merge for
+/// a result identical to asking once. Sessions arrive in server priority order, so keeping the first
+/// of each preserves the ordering the merge depends on to resolve scalar conflicts.
+fn one_session_per_server(
+    sessions: &[(AuthorizationSession, Server)],
+) -> Vec<(AuthorizationSession, Server)> {
+    let mut seen = HashSet::new();
+    sessions
+        .iter()
+        .filter(|(_, server)| seen.insert(server.id.as_i64()))
+        .cloned()
+        .collect()
 }
 
 async fn fan_out(
@@ -281,6 +302,73 @@ mod tests {
         merge_into(&mut merged, json!({ "tags": ["b"] }));
 
         assert_eq!(merged["tags"], json!(["a", "b"]));
+    }
+
+    fn session_on(server_id: i64, device: &str) -> (AuthorizationSession, Server) {
+        use crate::{config::MediaStreamingMode, server_id::ServerId, server_url::ServerUrl};
+
+        let server = Server {
+            id: ServerId::new(server_id),
+            name: format!("server-{server_id}"),
+            url: ServerUrl::parse(&format!("http://server-{server_id}.example")).unwrap(),
+            priority: 100 - server_id as i32,
+            media_streaming_mode: MediaStreamingMode::Proxy,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let session = AuthorizationSession {
+            id: server_id,
+            user_id: "user".to_string(),
+            mapping_id: server_id,
+            server_url: server.url.to_string(),
+            device: crate::user_authorization_service::Device {
+                client: "client".to_string(),
+                device: device.to_string(),
+                device_id: format!("{device}-id"),
+                version: "1".to_string(),
+            },
+            jellyfin_token: "token".to_string(),
+            original_user_id: "upstream".to_string(),
+            expires_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        (session, server)
+    }
+
+    /// A user collects a session per device per server, and a token-only plugin call matches all of
+    /// them. Fanning out per session asked two servers the same question seven times and merged
+    /// seven copies of a five-figure payload — identical output for several times the work.
+    #[test]
+    fn each_server_is_asked_once_however_many_devices_the_user_has() {
+        let sessions = vec![
+            session_on(1, "Gaming"),
+            session_on(2, "Gaming"),
+            session_on(2, "Chrome"),
+            session_on(1, "Chrome"),
+            session_on(2, "Phone"),
+        ];
+
+        let deduped = one_session_per_server(&sessions);
+
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(
+            deduped
+                .iter()
+                .map(|(_, s)| s.id.as_i64())
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "the first session for each server wins, keeping server priority order"
+        );
+    }
+
+    /// One server means the pinned path already gives the same answer, so federating would only add
+    /// a round trip.
+    #[test]
+    fn a_single_server_is_not_federated() {
+        let sessions = vec![session_on(1, "Gaming"), session_on(1, "Chrome")];
+
+        assert_eq!(one_session_per_server(&sessions).len(), 1);
     }
 
     /// A plugin that keys by item id at the root, with no container field, merges the same way.
