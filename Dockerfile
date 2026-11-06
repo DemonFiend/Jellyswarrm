@@ -18,7 +18,7 @@ WORKDIR /app/ui
 # failing on a missing package.json, fetch the pinned commit directly. A
 # checkout that does have the submodule keeps using it, leaving local builds
 # unaffected.
-ARG JELLYFIN_WEB_COMMIT=c06cb17b274c10f9015412305edb0afdc010ae7a
+ARG JELLYFIN_WEB_COMMIT=0a580ce8df89282dfd120b6d5efb8e106da23bd5
 
 COPY ui/ ./
 
