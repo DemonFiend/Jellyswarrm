@@ -146,6 +146,17 @@ fn default_deduplicate_media() -> bool {
     false
 }
 
+/// Origin that serves the browser's Jellyfin web client, if the proxy should not serve its own.
+///
+/// Deliberately a URL rather than a reference to a configured server. The client and the plugin
+/// UI it carries are a presentation concern, not a media concern: pointing this at a dedicated
+/// plugin-host instance that holds no libraries stays a config change rather than a rewrite.
+///
+/// Empty means serve the bundled client, which is the default and the behaviour without this.
+fn default_web_client_host() -> String {
+    String::new()
+}
+
 mod base64_serde {
     use super::*;
     use serde::de::Error as DeError;
@@ -244,6 +255,7 @@ define_fallback_deserializer!(
     bool,
     default_deduplicate_media
 );
+define_fallback_deserializer!(deserialize_web_client_host, String, default_web_client_host);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PreconfiguredServer {
@@ -258,6 +270,36 @@ pub struct PreconfiguredServer {
 pub struct DebugUser {
     pub username: String,
     pub password: Password,
+}
+
+/// Top-level routes relayed to the pinned client host.
+///
+/// `/MediaBar` is listed even though the current Media Bar release loads its script from a CDN
+/// rather than serving it: the plugin still exposes configuration endpoints under that prefix, and
+/// older releases self-host the asset.
+fn default_plugin_asset_prefixes() -> Vec<String> {
+    [
+        "/PluginPages",
+        "/MediaBar",
+        "/CustomTabs",
+        "/HomeScreen/home-screen-sections.js",
+        "/HomeScreen/home-screen-sections.css",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Per-plugin federation policy.
+///
+/// Client-side plugins keep their assets and their configuration on each media server, so every
+/// one of them raises the same question: when several servers disagree, whose answer reaches the
+/// browser? Holding those answers in configuration rather than in constants means changing one
+/// does not require a rebuild, and makes the policy in force legible from the config file.
+#[derive(Debug, Clone, Deserialize, Serialize, DefaultFromSerde)]
+pub struct PluginFederationConfig {
+    #[serde(default = "default_plugin_asset_prefixes")]
+    pub plugin_asset_prefixes: Vec<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, DefaultFromSerde)]
@@ -338,6 +380,15 @@ pub struct AppConfig {
         alias = "deduplicate_movies"
     )]
     pub deduplicate_media: bool,
+
+    #[serde(
+        default = "default_web_client_host",
+        deserialize_with = "deserialize_web_client_host"
+    )]
+    pub web_client_host: String,
+
+    #[serde(default)]
+    pub plugin_federation: PluginFederationConfig,
 }
 
 impl fmt::Debug for AppConfig {
@@ -371,6 +422,8 @@ impl fmt::Debug for AppConfig {
                 &self.auto_create_users_on_login,
             )
             .field("deduplicate_media", &self.deduplicate_media)
+            .field("web_client_host", &self.web_client_host)
+            .field("plugin_federation", &self.plugin_federation)
             .finish()
     }
 }

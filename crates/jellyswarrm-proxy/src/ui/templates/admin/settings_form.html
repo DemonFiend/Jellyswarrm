@@ -19,6 +19,20 @@
     <label>Merge Duplicate Movies & Shows Across Servers
       <input type="checkbox" role="switch" name="deduplicate_media" value="true" {% if deduplicate_media %}checked{% endif %}>
     </label>
+    <label>Web Client Host
+      <input type="url" name="web_client_host" value="{{ web_client_host }}" list="web-client-hosts"
+             placeholder="Pick a server, or leave empty for the bundled client" autocomplete="off">
+      <datalist id="web-client-hosts">
+        {% for url in server_urls %}<option value="{{ url }}"></option>{% endfor %}
+      </datalist>
+      <small>
+        Serve the browser client from this Jellyfin instead of the bundled copy. Required for
+        client-side plugins &mdash; Media Bar, Home Screen Sections, Custom Tabs, Plugin Pages
+        and anything else injected by File Transformation &mdash; because the proxy is not a
+        Jellyfin server and has nothing to inject them with. Leave empty to serve the bundled
+        client, which carries no plugins.
+      </small>
+    </label>
   </fieldset>
   <div style="display:flex; gap:.5rem;">
     <button type="submit">Save</button>
