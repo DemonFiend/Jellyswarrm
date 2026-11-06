@@ -89,8 +89,29 @@ pub struct QuickConnectAuthenticateRequest {
     pub secret: String,
 }
 
+/// Codes and secrets live in separate keyspaces, deliberately.
+///
+/// A Quick Connect **code** is public by design — it is displayed so it can be read aloud or typed
+/// into another device — while the **secret** is the bearer credential the waiting client redeems
+/// for a token. Keying one map by both made every lookup accept either, so the code *was* a secret:
+/// anyone who could see the screen could redeem the session.
+#[derive(Default)]
+struct SessionStore {
+    by_secret: HashMap<String, QuickConnectSession>,
+    secret_by_code: HashMap<String, String>,
+}
+
+impl SessionStore {
+    /// Drop a session and the code pointing at it, so neither keyspace keeps a dangling entry.
+    fn forget(&mut self, secret: &str) {
+        if let Some(session) = self.by_secret.remove(secret) {
+            self.secret_by_code.remove(&session.code);
+        }
+    }
+}
+
 pub struct QuickConnectStorage {
-    sessions: Arc<Mutex<HashMap<String, QuickConnectSession>>>,
+    sessions: Arc<Mutex<SessionStore>>,
 }
 
 impl Default for QuickConnectStorage {
@@ -102,25 +123,26 @@ impl Default for QuickConnectStorage {
 impl QuickConnectStorage {
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(SessionStore::default())),
         }
     }
 
     pub fn store_session(&self, session: QuickConnectSession) {
         let mut sessions = self.sessions_lock();
-        sessions.insert(session.secret.clone(), session.clone());
-        sessions.insert(session.code.clone(), session);
+        sessions
+            .secret_by_code
+            .insert(session.code.clone(), session.secret.clone());
+        sessions.by_secret.insert(session.secret.clone(), session);
     }
 
-    pub fn get_session(&self, key: &str) -> Option<QuickConnectSession> {
+    /// Resolve a session by its **secret** only. A code will not resolve here, which is the point.
+    pub fn get_session(&self, secret: &str) -> Option<QuickConnectSession> {
         let mut sessions = self.sessions_lock();
 
-        if let Some(session) = sessions.get(key) {
+        if let Some(session) = sessions.by_secret.get(secret) {
             if session.is_expired() {
-                let secret = session.secret.clone();
-                let code = session.code.clone();
-                sessions.remove(&secret);
-                sessions.remove(&code);
+                let secret = secret.to_string();
+                sessions.forget(&secret);
                 return None;
             }
 
@@ -137,20 +159,19 @@ impl QuickConnectStorage {
     ) -> bool {
         let mut sessions = self.sessions_lock();
 
-        if let Some(session) = sessions.get(code).cloned() {
+        let Some(secret) = sessions.secret_by_code.get(code).cloned() else {
+            return false;
+        };
+
+        if let Some(session) = sessions.by_secret.get(&secret).cloned() {
             if session.is_expired() {
-                let secret = session.secret.clone();
-                sessions.remove(&secret);
-                sessions.remove(code);
+                sessions.forget(&secret);
                 return false;
             }
 
             let mut updated_session = session;
             updater(&mut updated_session);
-
-            let secret = updated_session.secret.clone();
-            sessions.insert(secret, updated_session.clone());
-            sessions.insert(code.to_string(), updated_session);
+            sessions.by_secret.insert(secret, updated_session);
             return true;
         }
 
@@ -160,8 +181,8 @@ impl QuickConnectStorage {
     pub fn remove_session(&self, secret: &str) -> Option<QuickConnectSession> {
         let mut sessions = self.sessions_lock();
 
-        if let Some(session) = sessions.remove(secret) {
-            sessions.remove(&session.code);
+        if let Some(session) = sessions.by_secret.remove(secret) {
+            sessions.secret_by_code.remove(&session.code);
             return Some(session);
         }
 
@@ -170,17 +191,15 @@ impl QuickConnectStorage {
 
     pub fn cleanup_expired(&self) -> usize {
         let mut sessions = self.sessions_lock();
-        let mut expired = Vec::new();
+        let expired: Vec<String> = sessions
+            .by_secret
+            .values()
+            .filter(|session| session.is_expired())
+            .map(|session| session.secret.clone())
+            .collect();
 
-        for session in sessions.values() {
-            if session.is_expired() {
-                expired.push((session.secret.clone(), session.code.clone()));
-            }
-        }
-
-        for (secret, code) in &expired {
-            sessions.remove(secret);
-            sessions.remove(code);
+        for secret in &expired {
+            sessions.forget(secret);
         }
 
         expired.len()
@@ -201,7 +220,7 @@ impl QuickConnectStorage {
         });
     }
 
-    fn sessions_lock(&self) -> MutexGuard<'_, HashMap<String, QuickConnectSession>> {
+    fn sessions_lock(&self) -> MutexGuard<'_, SessionStore> {
         self.sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -376,13 +395,14 @@ async fn resolve_authorize_user_id(
     headers: &HeaderMap,
     user_id: Option<UserId>,
 ) -> Result<UserId, StatusCode> {
-    if let Some(user_id) = user_id {
-        return Ok(user_id);
-    }
-
+    // Who is approving is taken from the caller's own token, always. A `userId` in the query is a
+    // claim about who is approving and never evidence of it: honouring it let anyone able to reach
+    // this endpoint approve a pending code as any user, presenting no credential whatsoever. The
+    // code being approved is displayed on a screen, so reaching this point knowing one is not a
+    // meaningful barrier.
     let token = extract_virtual_token(headers).ok_or_else(|| {
-        warn!("Quick Connect authorize called without userId and without a virtual token");
-        StatusCode::BAD_REQUEST
+        warn!("Quick Connect authorize called without an authenticated caller");
+        StatusCode::UNAUTHORIZED
     })?;
 
     let user = state
@@ -394,6 +414,19 @@ async fn resolve_authorize_user_id(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // A caller may still name themselves; they may not name anybody else. Refusing beats silently
+    // substituting the authenticated user, which would leave a caller believing they had approved
+    // a code on someone else's behalf.
+    if let Some(claimed) = user_id {
+        if claimed != user.id {
+            warn!(
+                "Quick Connect authorize claimed user {} but the caller authenticated as {}",
+                claimed, user.id
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
 
     Ok(user.id)
 }
@@ -779,6 +812,97 @@ mod tests {
             processors,
             QuickConnectStorage::new(),
         )
+    }
+
+    fn pending_session() -> QuickConnectSession {
+        QuickConnectSession::new(
+            "secret-abcdef".to_string(),
+            "123456".to_string(),
+            "device-1".to_string(),
+            "Test Device".to_string(),
+            "Test App".to_string(),
+            "1.0".to_string(),
+        )
+    }
+
+    /// The code is shown on screen so it can be read aloud; the secret is the bearer credential the
+    /// waiting client redeems. Holding both in one map made every lookup accept either, so anyone
+    /// who could see the code could redeem the session as its owner.
+    #[test]
+    fn a_code_cannot_be_redeemed_as_a_secret() {
+        let storage = QuickConnectStorage::new();
+        storage.store_session(pending_session());
+
+        assert!(
+            storage.get_session("secret-abcdef").is_some(),
+            "the secret must still resolve"
+        );
+        assert!(
+            storage.get_session("123456").is_none(),
+            "the public code must not resolve where a secret is expected"
+        );
+    }
+
+    /// Separating the keyspaces must not break approval, which legitimately happens by code.
+    #[test]
+    fn a_session_is_still_approved_by_its_code() {
+        let storage = QuickConnectStorage::new();
+        storage.store_session(pending_session());
+
+        let updated = storage.update_session_by_code("123456", |session| {
+            session.authenticated = true;
+        });
+
+        assert!(updated);
+        assert!(storage.get_session("secret-abcdef").unwrap().authenticated);
+        assert!(
+            !storage.update_session_by_code("secret-abcdef", |_| {}),
+            "a secret is not a code either; the separation runs both ways"
+        );
+    }
+
+    /// Removing a session must clear both keyspaces, or its code outlives it and points at nothing.
+    #[test]
+    fn removing_a_session_forgets_its_code() {
+        let storage = QuickConnectStorage::new();
+        storage.store_session(pending_session());
+        storage.remove_session("secret-abcdef");
+
+        assert!(!storage.update_session_by_code("123456", |_| {}));
+    }
+
+    /// `userId` on the authorize call is a claim, not evidence. Honouring it let anyone holding a
+    /// displayed code approve it as any user, with no credential presented at all.
+    #[tokio::test]
+    async fn authorize_refuses_a_caller_who_names_another_user() {
+        let state = create_test_app_state().await;
+        state.quick_connect.store_session(pending_session());
+
+        let result = handle_quick_connect_authorize(
+            Query(AuthorizeQuery {
+                code: "123456".to_string(),
+                user_id: Some(UserId::from("00000000000000000000000000000001")),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(StatusCode::UNAUTHORIZED) | Err(StatusCode::FORBIDDEN)
+            ),
+            "an unauthenticated caller naming a user must be refused, got {result:?}"
+        );
+        assert!(
+            !state
+                .quick_connect
+                .get_session("secret-abcdef")
+                .unwrap()
+                .authenticated,
+            "the session must not have been approved"
+        );
     }
 
     #[test]
