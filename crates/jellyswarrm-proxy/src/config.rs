@@ -328,6 +328,20 @@ fn default_federated_plugin_api_prefixes() -> Vec<String> {
         .collect()
 }
 
+/// Home screen sections whose content comes from an external service rather than the local library,
+/// matched as normalised prefixes because the plugin names variants by suffix.
+fn default_single_source_section_prefixes() -> Vec<String> {
+    ["discover", "myjellyseerrrequests", "jellyseerr", "upcoming"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Sections that list the user's libraries rather than media items.
+fn default_library_view_sections() -> Vec<String> {
+    vec!["mymedia".to_string()]
+}
+
 /// Per-plugin federation policy.
 ///
 /// Client-side plugins keep their assets and their configuration on each media server, so every
@@ -344,6 +358,12 @@ pub struct PluginFederationConfig {
 
     #[serde(default = "default_federated_plugin_api_prefixes")]
     pub federated_plugin_api_prefixes: Vec<String>,
+
+    #[serde(default = "default_single_source_section_prefixes")]
+    pub single_source_section_prefixes: Vec<String>,
+
+    #[serde(default = "default_library_view_sections")]
+    pub library_view_sections: Vec<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, DefaultFromSerde)]

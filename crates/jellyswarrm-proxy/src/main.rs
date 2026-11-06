@@ -819,6 +819,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "/Artists",
                 Router::new().route("/", get(handlers::federated::get_items_from_all_servers)),
             )
+            // Home Screen Sections data. Registered ahead of the catch-all so section rows are
+            // merged across servers instead of being answered by whichever single server
+            // resolves, and ahead of the pinned asset routes below, which deliberately cover the
+            // plugin's script and stylesheet only.
+            .route(
+                "/HomeScreen/Section/{sectiontype}",
+                get(handlers::home_screen::get_home_screen_section),
+            )
             // The client application, pinned to one origin. Registered ahead of the
             // catch-all so asset requests never reach the per-request server resolution
             // that lets one page load draw its index.html and its chunks from two
