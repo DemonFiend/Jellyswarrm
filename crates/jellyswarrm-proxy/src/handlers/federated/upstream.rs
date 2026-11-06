@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use hyper::StatusCode;
 use tokio::task::JoinSet;
@@ -173,7 +173,8 @@ pub(super) async fn fetch_show_catalog(
             response_shape: ResponseShape::Counted,
         });
     }
-    let (indexed_results, failures) = collect_federated_results(join_set, failures).await?;
+    let (indexed_results, failures) =
+        collect_federated_results(join_set, failures, leg_timeout(state).await).await?;
     if failures > 0 {
         warn!(
             "Returning partial federated show response after {} server failure(s)",
@@ -306,7 +307,8 @@ pub(super) async fn fetch_catalog(
         });
     }
 
-    let (indexed_results, failures) = collect_federated_results(join_set, failures).await?;
+    let (indexed_results, failures) =
+        collect_federated_results(join_set, failures, leg_timeout(state).await).await?;
     if failures > 0 {
         warn!(
             "Returning partial federated response after {} server failure(s)",
@@ -330,19 +332,47 @@ pub(super) async fn fetch_catalog(
     })
 }
 
+/// The configured per-leg deadline.
+async fn leg_timeout(state: &AppState) -> Duration {
+    Duration::from_secs(state.config.read().await.federated_leg_timeout)
+}
+
+/// Collects every leg, abandoning any that overruns `leg_timeout`.
+///
+/// The deadline covers the whole fan-out rather than each leg separately, which comes to the same
+/// thing because the legs run concurrently: the slowest decides when the merge can finish. Legs
+/// that have already answered are kept and the stragglers are aborted, so a merged response is
+/// bounded by this rather than by the client timeout, and nested page fetches inside a leg are
+/// bounded with it.
 async fn collect_federated_results<T: Send + 'static>(
     mut join_set: JoinSet<(usize, Result<T, StatusCode>)>,
     mut failures: usize,
+    leg_timeout: Duration,
 ) -> Result<(Vec<(usize, T)>, usize), StatusCode> {
     let mut indexed_results = Vec::new();
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok((index, Ok(items))) => indexed_results.push((index, items)),
-            Ok((_, Err(e))) => {
+    let deadline = tokio::time::Instant::now() + leg_timeout;
+
+    loop {
+        match tokio::time::timeout_at(deadline, join_set.join_next()).await {
+            Err(_elapsed) => {
+                let abandoned = join_set.len();
+                if abandoned > 0 {
+                    failures += abandoned;
+                    warn!(
+                        "{abandoned} federated leg(s) exceeded the {}s deadline; merging what answered",
+                        leg_timeout.as_secs()
+                    );
+                }
+                join_set.abort_all();
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some(Ok((index, Ok(items))))) => indexed_results.push((index, items)),
+            Ok(Some(Ok((_, Err(e))))) => {
                 failures += 1;
                 error!("Federated server request failed: {:?}", e);
             }
-            Err(e) => {
+            Ok(Some(Err(e))) => {
                 failures += 1;
                 error!("Task failed: {:?}", e);
             }
