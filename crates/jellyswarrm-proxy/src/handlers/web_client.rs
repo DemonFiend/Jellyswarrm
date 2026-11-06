@@ -28,16 +28,18 @@ use tracing::{debug, error, warn};
 
 use crate::{proxy_headers::is_hop_by_hop_header, AppState};
 
-/// Whether the configured client host should serve this path.
+/// Whether `path` falls under one of `prefixes`, matched on a path-segment boundary.
 ///
-/// The prefixes are configuration rather than a constant: they are top-level routes registered by
-/// whichever client-side plugins are installed, so the correct list depends on the deployment. The
-/// shipped default is in [`crate::config::PluginFederationConfig`].
+/// The prefixes are configuration rather than constants: they are top-level routes registered by
+/// whichever client-side plugins are installed, so the correct lists depend on the deployment. The
+/// shipped defaults are in [`crate::config::PluginFederationConfig`], which holds two separate
+/// lists this is used against - `plugin_asset_prefixes`, relayed verbatim, and
+/// `plugin_api_prefixes`, pinned but authenticated.
 ///
-/// Only asset and configuration surfaces belong in that list. Endpoints that return media items are
-/// data, not chrome, and federating those across servers is a separate concern — a route added here
-/// would be pinned to one server and silently stop merging.
-pub fn is_plugin_asset_path(path: &str, prefixes: &[String]) -> bool {
+/// Only asset and configuration surfaces belong in the asset list. Endpoints that return media
+/// items are data, not chrome, and federating those across servers is a separate concern - a route
+/// added there would be pinned to one server and silently stop merging.
+pub fn matches_plugin_prefix(path: &str, prefixes: &[String]) -> bool {
     prefixes
         .iter()
         .any(|prefix| path.eq_ignore_ascii_case(prefix) || starts_with_segment(path, prefix))
@@ -216,7 +218,7 @@ pub async fn plugin_asset_handler(
     // request path rather than failing, so a misfiled route degrades to the unpinned behaviour.
     let prefixes = plugin_asset_prefixes(&state).await;
     let path = req.uri().path();
-    if !is_plugin_asset_path(path, &prefixes) {
+    if !matches_plugin_prefix(path, &prefixes) {
         error!("Refusing to pin {path} to the web client host: it is not a plugin asset route");
         return crate::proxy_handler(State(state), req).await;
     }
@@ -246,19 +248,19 @@ mod tests {
     #[test]
     fn plugin_asset_paths_match_on_segment_boundaries() {
         let p = prefixes();
-        assert!(is_plugin_asset_path("/MediaBar", &p));
-        assert!(is_plugin_asset_path("/MediaBar/WebConfig", &p));
-        assert!(is_plugin_asset_path("/mediabar/webconfig", &p));
-        assert!(is_plugin_asset_path("/PluginPages/inject.js", &p));
-        assert!(is_plugin_asset_path("/CustomTabs/Config", &p));
-        assert!(is_plugin_asset_path(
+        assert!(matches_plugin_prefix("/MediaBar", &p));
+        assert!(matches_plugin_prefix("/MediaBar/WebConfig", &p));
+        assert!(matches_plugin_prefix("/mediabar/webconfig", &p));
+        assert!(matches_plugin_prefix("/PluginPages/inject.js", &p));
+        assert!(matches_plugin_prefix("/CustomTabs/Config", &p));
+        assert!(matches_plugin_prefix(
             "/HomeScreen/home-screen-sections.js",
             &p
         ));
 
         // A prefix that merely starts with the same letters is a different route.
-        assert!(!is_plugin_asset_path("/MediaBarSomethingElse", &p));
-        assert!(!is_plugin_asset_path("/PluginPagesExtra/thing", &p));
+        assert!(!matches_plugin_prefix("/MediaBarSomethingElse", &p));
+        assert!(!matches_plugin_prefix("/PluginPagesExtra/thing", &p));
     }
 
     /// The shipped list is what makes the named plugins work with no configuration at all, so it is
@@ -285,11 +287,11 @@ mod tests {
             .filter(|p| p != "/MediaBar")
             .collect();
 
-        assert!(!is_plugin_asset_path(
+        assert!(!matches_plugin_prefix(
             "/MediaBar/WebConfig",
             &without_mediabar
         ));
-        assert!(is_plugin_asset_path(
+        assert!(matches_plugin_prefix(
             "/CustomTabs/Config",
             &without_mediabar
         ));
@@ -301,13 +303,13 @@ mod tests {
     #[test]
     fn section_data_endpoints_are_not_treated_as_assets() {
         let p = prefixes();
-        assert!(!is_plugin_asset_path("/HomeScreen/Sections", &p));
-        assert!(!is_plugin_asset_path(
+        assert!(!matches_plugin_prefix("/HomeScreen/Sections", &p));
+        assert!(!matches_plugin_prefix(
             "/HomeScreen/Section/RecentlyAddedMovies",
             &p
         ));
-        assert!(!is_plugin_asset_path("/HomeScreen/Meta", &p));
-        assert!(!is_plugin_asset_path("/HomeScreen/CachedImage/abc", &p));
+        assert!(!matches_plugin_prefix("/HomeScreen/Meta", &p));
+        assert!(!matches_plugin_prefix("/HomeScreen/CachedImage/abc", &p));
     }
 
     /// A pinned host that is merely restarting must not take the whole UI down. The fallback maps
@@ -341,5 +343,40 @@ mod tests {
             response.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
         );
+    }
+
+    /// The two prefix lists are different mechanisms, and confusing them is the easy mistake. An
+    /// asset prefix is relayed verbatim, which sends the *proxy's* own access token, so any
+    /// endpoint that identifies the caller sees an unknown user - the reason pinning
+    /// `/HomeScreen/Meta` as an asset failed. Enhanced's endpoints do identify the caller, so they
+    /// belong in the API list and must stay out of the asset one.
+    #[test]
+    fn plugin_api_prefixes_are_not_asset_prefixes() {
+        let config = crate::config::PluginFederationConfig::default();
+
+        assert_eq!(
+            config.plugin_api_prefixes,
+            vec!["/JellyfinEnhanced", "/JellyTweaks"]
+        );
+        for prefix in &config.plugin_api_prefixes {
+            assert!(
+                !matches_plugin_prefix(prefix, &config.plugin_asset_prefixes),
+                "{prefix} must not be relayed as an asset"
+            );
+        }
+    }
+
+    /// The API list is matched by the same segment-boundary rule, so a plugin whose route merely
+    /// starts with the same letters is not swept onto the pinned server.
+    #[test]
+    fn plugin_api_paths_match_on_segment_boundaries() {
+        let api = crate::config::PluginFederationConfig::default().plugin_api_prefixes;
+
+        assert!(matches_plugin_prefix(
+            "/JellyfinEnhanced/tag-cache/abc",
+            &api
+        ));
+        assert!(matches_plugin_prefix("/jellyfinenhanced/plugin.js", &api));
+        assert!(!matches_plugin_prefix("/JellyfinEnhancedExtra/thing", &api));
     }
 }

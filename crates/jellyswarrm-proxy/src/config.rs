@@ -290,6 +290,26 @@ fn default_plugin_asset_prefixes() -> Vec<String> {
     .collect()
 }
 
+/// Plugin routes that must reach the server whose web client is being served, **authenticated**.
+///
+/// Distinct from [`default_plugin_asset_prefixes`] in two ways that matter. Those are relayed
+/// verbatim, which is correct for scripts and stylesheets but sends the *proxy's* access token - so
+/// any endpoint that identifies the caller sees an unknown user. And they only apply to paths with
+/// a route registered for them, so adding a new prefix there alone has no effect. These go through
+/// normal request processing instead: the token is swapped for the target server's and ids are
+/// remapped, exactly as for any other API call, but the server is pinned rather than resolved per
+/// request.
+///
+/// The default covers Jellyfin Enhanced, whose endpoints identify the user from the token and are
+/// otherwise answered by whichever server a request happens to resolve to - a server that may not
+/// run the plugin at all.
+fn default_plugin_api_prefixes() -> Vec<String> {
+    ["/JellyfinEnhanced", "/JellyTweaks"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Per-plugin federation policy.
 ///
 /// Client-side plugins keep their assets and their configuration on each media server, so every
@@ -300,6 +320,9 @@ fn default_plugin_asset_prefixes() -> Vec<String> {
 pub struct PluginFederationConfig {
     #[serde(default = "default_plugin_asset_prefixes")]
     pub plugin_asset_prefixes: Vec<String>,
+
+    #[serde(default = "default_plugin_api_prefixes")]
+    pub plugin_api_prefixes: Vec<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, DefaultFromSerde)]
