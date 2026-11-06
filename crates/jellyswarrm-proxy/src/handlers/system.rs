@@ -7,6 +7,28 @@ use crate::{
     request_preprocessing::JellyfinAuthorization, ui::JELLYFIN_UI_VERSION, AppState,
 };
 
+/// Whether a string is shaped like a Jellyfin server version - dot-separated numbers.
+///
+/// jellyfin-web parses this value and refuses to start with "Update Required" if it cannot, so a
+/// malformed value is indistinguishable to the user from a genuinely unsupported server.
+///
+/// The version is read from a generated `ui-version.env`, and a build that skips UI generation
+/// leaves whatever was there before. One observed file embedded a literal backslash-n instead of a
+/// newline, so the line-based parser read the whole remainder of the file as the version:
+/// `/System/Info/Public` advertised `0.0.0\nUI_COMMIT=dev` and no client would load at all. The
+/// failure gives no clue as to its cause, since the client simply says the server is too old.
+///
+/// Checking the shape here means a stale or malformed file degrades to the fallback rather than
+/// bricking every client. jellyfin-web keeps package.json numeric even for release candidates, so
+/// nothing legitimate is rejected by requiring digits.
+fn is_version_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').count() >= 2
+        && value
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
 fn reported_server_version() -> String {
     // Jellyfin Web refuses to load when Version is empty/unknown ("Update Required").
     // Always report the embedded web client's version so the UI stays compatible.
@@ -16,8 +38,9 @@ fn reported_server_version() -> String {
         .version
         .trim()
         .to_string();
-    if version.is_empty() || version.eq_ignore_ascii_case("unknown") {
-        // Fallback for test builds that skip ui-version.env generation.
+    if !is_version_shaped(&version) {
+        // Fallback for test builds that skip ui-version.env generation, and for a malformed
+        // or stale file left behind by one.
         "12.0.0".to_string()
     } else {
         version
@@ -95,4 +118,28 @@ pub async fn info(
         id: cfg.server_id.clone(),
         startup_wizard_completed: Some(true),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_version_shaped;
+
+    #[test]
+    fn real_client_versions_are_accepted() {
+        // What jellyfin-web actually puts in package.json, release candidates included.
+        for version in ["12.4.0", "12.0.0", "10.11.10", "10.11.0"] {
+            assert!(is_version_shaped(version), "{version} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_malformed_version_file_is_rejected_rather_than_advertised() {
+        // The observed failure: a literal backslash-n in ui-version.env, so the line-based parser
+        // swallowed the rest of the file. Advertising this made every client refuse to load.
+        assert!(!is_version_shaped("0.0.0\nUI_COMMIT=dev"));
+
+        for version in ["", "unknown", "12", "dev", "12..0", "v12.4.0", "12.4.0-dev"] {
+            assert!(!is_version_shaped(version), "{version} should be rejected");
+        }
+    }
 }
