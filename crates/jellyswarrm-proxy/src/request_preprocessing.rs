@@ -353,7 +353,7 @@ pub async fn extract_request_infos(
                 .server_storage
                 .server_status(server.id)
                 .await
-                .is_healthy()
+                .is_routable()
             {
                 filtered_sessions.push((session, server));
             }
@@ -891,7 +891,7 @@ async fn server_from_body_media_aggregate_ids(
                     .server_storage
                     .server_status(member.server.id)
                     .await
-                    .is_healthy()
+                    .is_routable()
             {
                 healthy_members.push(member);
             }

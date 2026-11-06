@@ -100,6 +100,8 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for ServerAdmin {
 pub enum ServerHealthStatus {
     /// Server is healthy
     Healthy(PublicSystemInfo),
+    /// Server has not been probed yet, so nothing is known about it either way
+    Unknown,
     /// Server is unhealthy with reason
     Unhealthy(String),
 }
@@ -107,6 +109,20 @@ pub enum ServerHealthStatus {
 impl ServerHealthStatus {
     pub fn is_healthy(&self) -> bool {
         matches!(self, ServerHealthStatus::Healthy(_))
+    }
+
+    /// Whether a request may be sent to this server.
+    ///
+    /// Deliberately weaker than [`Self::is_healthy`]: it excludes only servers a probe has actually
+    /// *confirmed* to be down. An unprobed server is included, because treating "not yet known" as
+    /// "offline" silently drops it from every fan-out - and since the probe loop only runs every
+    /// `server_background_check_interval_secs`, that is the state every server is in for the first
+    /// seconds after start-up, and the state a server returns to after a single missed probe.
+    ///
+    /// An excluded server does not surface as an error: the fan-out drops it and the client gets a
+    /// normal 200 carrying half the catalogue. So this must fail open rather than closed.
+    pub fn is_routable(&self) -> bool {
+        !matches!(self, ServerHealthStatus::Unhealthy(_))
     }
 }
 
@@ -419,9 +435,7 @@ impl ServerStorageService {
         let health = self.health_status.read().await;
         health
             .get(&server_id)
-            .unwrap_or(&ServerHealthStatus::Unhealthy(
-                "Unknown Server Status".to_string(),
-            ))
+            .unwrap_or(&ServerHealthStatus::Unknown)
             .clone()
     }
 
@@ -435,7 +449,7 @@ impl ServerStorageService {
 
         let mut best_healthy = None;
         for server in &servers {
-            if self.server_status(server.id).await.is_healthy() {
+            if self.server_status(server.id).await.is_routable() {
                 best_healthy = Some(server);
                 break;
             }
@@ -445,7 +459,9 @@ impl ServerStorageService {
             Ok(Some(server.clone()))
         } else {
             // Fallback to first if exists
-            error!("No healthy servers found, falling back to first available server");
+            error!(
+                "Every server is confirmed offline; falling back to the highest-priority one anyway"
+            );
             Ok(servers.into_iter().next())
         }
     }
@@ -614,6 +630,101 @@ mod tests {
                 101,
                 MediaStreamingMode::Proxy
             )
+        );
+    }
+
+    /// An unprobed server must stay routable. The probe loop only runs every
+    /// `server_background_check_interval_secs`, so "not yet known" is the state every server is in
+    /// immediately after start-up - treating it as offline silently halves every merged response.
+    #[test]
+    fn only_confirmed_offline_servers_are_excluded_from_routing() {
+        let unknown = ServerHealthStatus::Unknown;
+        let unhealthy = ServerHealthStatus::Unhealthy("connection refused".to_string());
+
+        assert!(
+            !unknown.is_healthy(),
+            "an unprobed server is not positively healthy"
+        );
+        assert!(
+            unknown.is_routable(),
+            "an unprobed server must still be routed to"
+        );
+
+        assert!(!unhealthy.is_healthy());
+        assert!(
+            !unhealthy.is_routable(),
+            "a confirmed-offline server must be excluded"
+        );
+    }
+
+    /// `server_status` reports `Unknown` for a server it has never probed, rather than synthesising
+    /// an `Unhealthy("Unknown Server Status")` that reads as a real failure.
+    #[tokio::test]
+    async fn an_unprobed_server_reports_unknown_rather_than_unhealthy() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let storage = ServerStorageService::new(pool);
+        let server_id = storage
+            .add_server(
+                "Server",
+                "http://server.example",
+                100,
+                MediaStreamingMode::Proxy,
+            )
+            .await
+            .unwrap();
+
+        let status = storage.server_status(server_id).await;
+
+        assert_eq!(status, ServerHealthStatus::Unknown);
+        assert!(status.is_routable());
+    }
+
+    /// The discriminating case: a higher-priority server that a probe has *confirmed* offline must
+    /// lose to a lower-priority one that has merely never been probed.
+    ///
+    /// Asserting priority order alone would prove nothing, because `list_servers` is already
+    /// ordered by priority - so the old "nothing is healthy, take the first" fallback returned the
+    /// same server for the right reason by accident. Here the two answers differ: the old gate
+    /// excluded both servers and fell back to the dead one.
+    #[tokio::test]
+    async fn a_confirmed_offline_server_loses_to_an_unprobed_one() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let storage = ServerStorageService::new(pool);
+
+        // Port 1 is never listening, so the probe confirms this one down rather than leaving it
+        // unknown. It also outranks the other server, so priority cannot be what decides.
+        let dead = storage
+            .add_server("Dead", "http://127.0.0.1:1", 500, MediaStreamingMode::Proxy)
+            .await
+            .unwrap();
+        storage.check_servers_health().await;
+        assert!(
+            !storage.server_status(dead).await.is_routable(),
+            "the probe must have confirmed this server offline"
+        );
+
+        // Added after the probe, so it is genuinely unknown rather than known-good.
+        let unprobed = storage
+            .add_server(
+                "Unprobed",
+                "http://unprobed.example",
+                1,
+                MediaStreamingMode::Proxy,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.server_status(unprobed).await,
+            ServerHealthStatus::Unknown
+        );
+
+        let best = storage.get_best_server().await.unwrap().unwrap();
+
+        assert_eq!(
+            best.name, "Unprobed",
+            "a server not yet probed is still routable; one confirmed down is not"
         );
     }
 }

@@ -275,7 +275,7 @@ async fn fetch_member_source(
         .server_storage
         .server_status(host.server.id)
         .await
-        .is_healthy()
+        .is_routable()
     {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -491,7 +491,7 @@ pub(super) async fn resolve_playback_route(
         .server_storage
         .server_status(route.member_mapping.server_id)
         .await
-        .is_healthy()
+        .is_routable()
     {
         return Ok(PlaybackRouteDecision::SelectedSourceUnavailable);
     }

@@ -37,7 +37,7 @@ impl RequestAnalyzer {
                 .server_storage
                 .server_status(member.server.id)
                 .await
-                .is_healthy()
+                .is_routable()
             {
                 healthy_members.push(member);
             }
