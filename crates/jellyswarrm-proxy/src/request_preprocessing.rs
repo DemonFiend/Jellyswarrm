@@ -515,6 +515,8 @@ pub async fn apply_to_request(
 ) {
     remove_hop_by_hop_headers(request.headers_mut());
 
+    strip_client_accept_encoding(request);
+
     // Let reqwest derive Host from the target URL, including its port. An explicit
     // Host header would otherwise survive redirects to external image hosts.
     request.headers_mut().remove(reqwest::header::HOST);
@@ -545,6 +547,25 @@ pub async fn apply_new_target_uri(
     new_url.set_query(orig_url.query());
 
     *request.url_mut() = new_url;
+}
+
+/// Drop the client's `Accept-Encoding` so reqwest negotiates its own.
+///
+/// The proxy rewrites ids inside response bodies, so it must be able to decode every response it
+/// receives. `Accept-Encoding` is not a hop-by-hop header, so the browser's list is relayed
+/// verbatim - and a current browser offers `zstd`, which is not among the enabled reqwest features.
+/// The upstream then answers with `Content-Encoding: zstd`, the body fails to parse, and the
+/// response is forwarded with every id left in upstream space. That is silent, and to the client it
+/// looks like items that do not exist.
+///
+/// Letting reqwest advertise only what it can decode fixes the whole class rather than the one
+/// encoding; adding `zstd` to the feature list would leave the same bug latent for whatever
+/// browsers ship next. reqwest re-adds its own header at execution time when it is absent, and
+/// deliberately skips doing so for range requests, so media streaming is unaffected.
+pub fn strip_client_accept_encoding(request: &mut reqwest::Request) {
+    request
+        .headers_mut()
+        .remove(reqwest::header::ACCEPT_ENCODING);
 }
 
 pub fn apply_authorization_header(
@@ -1970,5 +1991,38 @@ mod tests {
             extract_request_infos(request, &state, Some(PlaybackSessionAction::Refresh)).await;
 
         assert!(result.is_err());
+    }
+
+    /// The proxy rewrites ids inside response bodies, so it must be able to decode every response
+    /// it receives. Forwarding the browser's `Accept-Encoding` verbatim lets an upstream answer in
+    /// an encoding reqwest cannot decode, after which the body fails to parse and is relayed with
+    /// upstream ids intact. Stripping the header lets reqwest advertise only what it can decode.
+    #[test]
+    fn client_accept_encoding_is_not_forwarded_upstream() {
+        let mut request = reqwest::Request::new(
+            reqwest::Method::GET,
+            url::Url::parse("http://upstream.example/Items").unwrap(),
+        );
+        request.headers_mut().insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("gzip, deflate, br, zstd"),
+        );
+        request.headers_mut().insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+
+        strip_client_accept_encoding(&mut request);
+
+        assert!(
+            !request
+                .headers()
+                .contains_key(reqwest::header::ACCEPT_ENCODING),
+            "Accept-Encoding must be stripped so reqwest negotiates an encoding it can decode"
+        );
+        assert!(
+            request.headers().contains_key(reqwest::header::ACCEPT),
+            "unrelated request headers must survive"
+        );
     }
 }
