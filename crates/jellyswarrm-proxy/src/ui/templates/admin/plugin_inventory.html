@@ -1,0 +1,198 @@
+{% if unreadable_count > 0 %}
+<article class="plugin-note-box plugin-warn" role="status">
+    <div>
+        <strong>{{ unreadable_count }} server(s) could not be read.</strong>
+        Plugin endpoints need administrator rights, which is a separate credential from the user
+        mapping that serves libraries &mdash; so this failing does not affect browsing or playback.
+        <ul class="plugin-reasons">
+            {% for server in servers %}{% if server.unreadable %}
+            <li><strong>{{ server.name }}</strong>: {{ server.error }}</li>
+            {% endif %}{% endfor %}
+        </ul>
+        An unreadable server is never counted as &ldquo;has no plugins&rdquo;, because that would
+        offer to install something that may already be there.
+    </div>
+</article>
+{% endif %}
+
+{% if restart_needed %}
+<article class="plugin-note-box plugin-act" role="status">
+    <div>
+        <strong>{{ restart_count }} server(s) have plugins waiting on a restart.</strong>
+        Jellyfin only loads plugins at start-up, so anything just installed does nothing until then.
+    </div>
+    <form hx-post="/{{ ui_route }}/plugins/restart" hx-target="#plugin-inventory" hx-swap="innerHTML"
+          hx-disabled-elt="find button" hx-confirm="Restart the affected servers now? Playback on them will be interrupted.">
+        <button type="submit">
+            <i class="fas fa-rotate-right" aria-hidden="true"></i>
+            Restart those servers
+        </button>
+    </form>
+</article>
+{% endif %}
+
+{% if !message.is_empty() %}
+<article class="plugin-note-box plugin-result" role="status">{{ message }}</article>
+{% endif %}
+
+<section class="plugin-targets">
+    <h2>Install targets</h2>
+    <p class="plugin-note">
+        Choose which servers an install applies to. Clicking <em>Install</em> on a plugin sends it to
+        every selected server that does not already have it &mdash; servers that do are skipped, so
+        pressing it twice changes nothing.
+    </p>
+    <div class="plugin-target-list">
+        {% for server in servers %}
+        <label class="plugin-target{% if server.unreadable %} is-unreadable{% endif %}">
+            <input type="checkbox" name="target" value="{{ server.id }}" form="plugin-install-targets"
+                   {% if !server.unreadable %}checked{% endif %} {% if server.unreadable %}disabled{% endif %}>
+            <span>{{ server.name }}</span>
+            {% if server.unreadable %}
+            <small>not readable</small>
+            {% else %}
+            <small>{{ server.installed_count }} installed{% if server.restart_count > 0 %} &middot; {{ server.restart_count }} awaiting restart{% endif %}</small>
+            {% endif %}
+        </label>
+        {% endfor %}
+    </div>
+</section>
+
+<form id="plugin-install-targets" hx-post="/{{ ui_route }}/plugins/install" hx-target="#plugin-inventory" hx-swap="innerHTML" hx-disabled-elt="find button"></form>
+
+{% for group in groups %}
+<details class="plugin-group"{% if group.expanded %} open{% endif %}>
+    <summary>
+        <span class="plugin-group-name">{{ group.name }}</span>
+        <span class="plugin-group-counts">
+            {{ group.installed_anywhere }} installed &middot; {{ group.total }} available
+            {% if group.drift_count > 0 %}
+            <span class="plugin-drift">{{ group.drift_count }} version mismatch</span>
+            {% endif %}
+        </span>
+    </summary>
+
+    <ul class="plugin-rows">
+        {% for row in group.rows %}
+        <li class="plugin-row">
+            <div class="plugin-row-main">
+                <span class="plugin-row-name">{{ row.name }}</span>
+                {% if row.has_drift %}
+                <span class="plugin-drift" title="Installed at different versions across servers">version mismatch</span>
+                {% endif %}
+            </div>
+
+            <div class="plugin-row-state">
+                {% if row.state_summary.is_empty() %}
+                <span class="plugin-unknown">not installed anywhere</span>
+                {% else %}
+                {{ row.state_summary }}
+                {% endif %}
+            </div>
+
+            <div class="plugin-row-action">
+                {% if row.missing_anywhere %}
+                <button type="submit" form="plugin-install-targets" class="secondary"
+                        name="plugin" value="{{ row.guid }}|{{ row.name }}">
+                    Install
+                </button>
+                {% else %}
+                <span class="plugin-present">on every server</span>
+                {% endif %}
+            </div>
+        </li>
+        {% endfor %}
+    </ul>
+</details>
+{% endfor %}
+
+<details class="plugin-group">
+    <summary>
+        <span class="plugin-group-name">Repositories</span>
+        <span class="plugin-group-counts">where plugins come from</span>
+    </summary>
+
+    <p class="plugin-note">
+        A repository only tells a server where to look; it installs nothing by itself. Adding one
+        appends to that server's existing list rather than replacing it.
+    </p>
+
+    <form hx-post="/{{ ui_route }}/plugins/repositories" hx-target="#plugin-inventory" hx-swap="innerHTML"
+          hx-disabled-elt="this" hx-on::after-request="if(event.detail.successful) this.reset()">
+        <div class="grid">
+            <input type="text" name="name" placeholder="Repository name" autocomplete="off" required>
+            <input type="url" name="url" placeholder="https://example.com/manifest.json" autocomplete="off" required>
+        </div>
+        <label>
+            <span>Add to</span>
+            <select name="server_id" required>
+                <option value="all">All readable servers</option>
+                {% for server in servers %}
+                <option value="{{ server.id }}">{{ server.name }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <button type="submit">
+            <i class="fas fa-plus" aria-hidden="true"></i>
+            Add repository
+        </button>
+    </form>
+
+    <ul class="plugin-repo-list">
+        {% for server in servers %}
+        <li>
+            <strong>{{ server.name }}</strong>
+            {% if server.unreadable %}
+            <span class="plugin-unknown">{{ server.error }}</span>
+            {% else if server.repositories.is_empty() %}
+            <span class="plugin-unknown">none</span>
+            {% else %}
+            {% for repo in server.repositories %}
+            <div class="plugin-repo">{{ repo.name }} <small>{{ repo.url }}</small></div>
+            {% endfor %}
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+</details>
+
+<style>
+    .plugin-note-box { padding: 0.75rem 1rem; margin: 0 0 1rem; display: flex; gap: 1rem;
+                       align-items: center; justify-content: space-between; flex-wrap: wrap; }
+    .plugin-note-box form { margin: 0; }
+    .plugin-note-box button { margin: 0; white-space: nowrap; }
+    .plugin-note { font-size: 0.85rem; opacity: 0.8; }
+    .plugin-reasons { margin: 0.5rem 0; padding-left: 1.2rem; font-size: 0.9rem; }
+    .plugin-reasons li { margin: 0.2rem 0; }
+
+    .plugin-target-list { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.5rem 0 1.5rem; }
+    .plugin-target { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.75rem;
+                     border: 1px solid; border-radius: 6px; cursor: pointer; margin: 0; }
+    .plugin-target input { margin: 0; }
+    .plugin-target small { opacity: 0.6; }
+    .plugin-target.is-unreadable { opacity: 0.5; cursor: not-allowed; }
+
+    .plugin-group { border: 1px solid; border-radius: 6px; margin-bottom: 0.75rem; padding: 0 1rem; }
+    .plugin-group > summary { cursor: pointer; padding: 0.75rem 0; display: flex;
+                              justify-content: space-between; align-items: baseline; gap: 1rem; }
+    .plugin-group-name { font-weight: 600; }
+    .plugin-group-counts { font-size: 0.8rem; opacity: 0.7; }
+
+    .plugin-rows { list-style: none; padding: 0; margin: 0 0 1rem; }
+    .plugin-row { display: grid; grid-template-columns: minmax(10rem, 1.4fr) minmax(8rem, 1.6fr) auto;
+                  gap: 1rem; align-items: center; padding: 0.4rem 0; border-top: 1px solid; }
+    .plugin-row-name { font-weight: 500; }
+    .plugin-row-state { font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+    .plugin-row-action button { margin: 0; padding: 0.25rem 0.9rem; font-size: 0.85rem; }
+    .plugin-present { font-size: 0.85rem; opacity: 0.7; }
+    .plugin-unknown { opacity: 0.6; font-style: italic; font-size: 0.85rem; }
+    .plugin-drift { font-size: 0.72rem; padding: 0.1rem 0.4rem; border: 1px solid;
+                    border-radius: 3px; margin-left: 0.4rem; white-space: nowrap; }
+
+    .plugin-repo-list { list-style: none; padding: 0; }
+    .plugin-repo small { display: block; opacity: 0.55; }
+
+    @media (max-width: 640px) {
+        .plugin-row { grid-template-columns: 1fr; gap: 0.25rem; }
+    }
+</style>

@@ -156,6 +156,14 @@ pub fn ui_routes() -> axum::Router<AppState> {
             post(admin::libraries::rename_group),
         )
         // Settings
+        .route("/plugins", get(admin::plugins::plugins_page))
+        .route("/plugins/inventory", get(admin::plugins::plugin_inventory))
+        .route("/plugins/install", post(admin::plugins::install))
+        .route("/plugins/restart", post(admin::plugins::restart_pending))
+        .route(
+            "/plugins/repositories",
+            post(admin::plugins::add_repository_form),
+        )
         .route("/settings", get(admin::settings::settings_page))
         .route("/settings/form", get(admin::settings::settings_form))
         .route("/settings/save", post(admin::settings::save_settings))

@@ -41,6 +41,7 @@ mod media_catalog;
 mod media_identity;
 mod media_storage_service;
 mod models;
+mod plugin_service;
 mod processors;
 mod proxy_headers;
 mod request_preprocessing;
