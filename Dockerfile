@@ -3,36 +3,52 @@
 #################################
 FROM node:24-alpine AS ui-build
 
-# Install git for version detection
+# git is needed both to report the UI commit and to fetch the client when the
+# submodule is not present in the build context.
 RUN apk add --no-cache git
 
 WORKDIR /app/ui
 
-# Copy package files for dependency caching
-COPY ui/package.json ui/package-lock.json* ./
+# The pinned jellyfin-web commit. Must match the `ui` submodule gitlink in this
+# repository, which `git ls-tree HEAD ui` prints.
+#
+# `docker build <git-url>#<branch>` clones the repository without its
+# submodules, so `ui/` arrives as an empty directory and there is no
+# `.git/modules/ui` to copy. That is how this image is built, so rather than
+# failing on a missing package.json, fetch the pinned commit directly. A
+# checkout that does have the submodule keeps using it, leaving local builds
+# unaffected.
+ARG JELLYFIN_WEB_COMMIT=c06cb17b274c10f9015412305edb0afdc010ae7a
+
+COPY ui/ ./
+
+RUN if [ -f package.json ]; then \
+      echo "Using the ui submodule from the build context"; \
+    else \
+      echo "Submodule absent; fetching jellyfin-web@${JELLYFIN_WEB_COMMIT}" && \
+      git init -q && \
+      git remote add origin https://github.com/jellyfin/jellyfin-web.git && \
+      git fetch -q --depth 1 origin "${JELLYFIN_WEB_COMMIT}" && \
+      git checkout -q FETCH_HEAD; \
+    fi
 
 # Install all dependencies (including dev deps needed for build)
 RUN --mount=type=cache,target=/root/.npm \
     npm install --engine-strict=false --ignore-scripts
 
-# Copy UI source code and git metadata
-COPY ui/ ./
-COPY .git/modules/ui/ /app/.git/modules/ui/
-
-# Get and print UI version info
-RUN UI_VERSION=$(node -p "require('./package.json').version") && \
-    UI_COMMIT=$(git rev-parse HEAD) && \
-    echo "UI_VERSION=${UI_VERSION#v}" && \
-    echo "UI_COMMIT=$UI_COMMIT"
-
 # Build production UI bundle
 RUN npm run build:production
 
-# Write ui-version.env file
+# Write ui-version.env file.
+#
+# The version comes from package.json, which is the value the web client parses
+# and refuses to start without. `git rev-parse` has nothing to read in a
+# submodule directory copied without its `.git`, so the commit falls back to the
+# pinned one rather than failing the build or recording "unknown".
 RUN UI_VERSION=$(node -p "require('./package.json').version") && \
-    UI_COMMIT=$(git rev-parse HEAD) && \
+    UI_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "${JELLYFIN_WEB_COMMIT}") && \
     printf "UI_VERSION=%s\nUI_COMMIT=%s\n" "${UI_VERSION#v}" "$UI_COMMIT" > dist/ui-version.env && \
-    echo "Generated dist/ui-version.env"
+    echo "Generated dist/ui-version.env: ${UI_VERSION#v} / $UI_COMMIT"
 
 
 
