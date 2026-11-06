@@ -294,6 +294,7 @@ mod tests {
             profile: ResponseProcessingProfile::Media,
             should_change_name: false,
             can_change_item_names: false,
+            media_id_object_keys: Default::default(),
         };
         let responses = ResponseProcessor::new(data.clone());
         let requests = RequestProcessor::new(data.clone());
