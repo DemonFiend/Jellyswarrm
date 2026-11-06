@@ -314,6 +314,10 @@ impl UrlProcessor {
                 }
             }
         }
+
+        if let Some(session) = session {
+            replace_proxy_user_id_in_path(url, session);
+        }
     }
 
     async fn replace_media_ids_in_path(
@@ -763,6 +767,52 @@ fn relative_url_from_parts(url: &url::Url) -> String {
         value.push_str(fragment);
     }
     value
+}
+
+/// Replace the proxy's own user id wherever it appears as a path segment.
+///
+/// [`USER_ID_PATH_TAGS`] finds a user id by the segment in front of it, which only works for the
+/// routes Jellyfin itself defines. A plugin addresses its own endpoints however it likes - Jellyfin
+/// Enhanced uses `/JellyfinEnhanced/user-settings/{id}/settings.json` and
+/// `/JellyfinEnhanced/tag-cache/{id}` - so no list of leading segments can cover them, and
+/// extending that list per plugin would put plugin trivia in the routing layer and still only cover
+/// the plugins somebody had already hit.
+///
+/// The id itself is the reliable marker. The proxy's user id is meaningless upstream, so a segment
+/// equal to it is always one the client took from a proxied response and always wants translating.
+/// Matching one known value rather than guessing which segments look like ids also leaves a
+/// plugin's own id-shaped data alone. Left in place, the upstream sees one user's id presented with
+/// another user's token and answers 403: per-user settings that silently fail to save, and tags
+/// that revert on every reload.
+///
+/// This hides from whoever set the proxy up, because where a proxy id happens to equal the upstream
+/// id - as it does for an administrator who was the first user on both - the path is valid and a
+/// missing file merely 404s, so the route looks correct while every other user gets a 403.
+///
+/// Segments are compared after normalisation, since a client only ever round-trips the id a
+/// proxied response gave it but may hold it in any UUID spelling.
+fn replace_proxy_user_id_in_path(url: &mut url::Url, session: &AuthorizationSession) {
+    let segments = decoded_path_segments(url.path());
+    let is_proxy_user_id = |segment: &String| UserId::new(segment.as_str()) == session.user_id;
+
+    if !segments.iter().any(is_proxy_user_id) {
+        return;
+    }
+
+    debug!(
+        "Replacing proxy user ID in path: {} -> {}",
+        session.user_id, session.original_user_id
+    );
+
+    if let Ok(mut path) = url.path_segments_mut() {
+        path.clear().extend(segments.iter().map(|segment| {
+            if is_proxy_user_id(segment) {
+                session.original_user_id.as_str()
+            } else {
+                segment.as_str()
+            }
+        }));
+    }
 }
 
 pub fn matches_case_insensitive(value: &str, candidates: &[&str]) -> bool {
@@ -1265,5 +1315,85 @@ mod tests {
                 .map(|(_, value)| value.into_owned()),
             Some("upstream-entry".to_string())
         );
+    }
+
+    /// A plugin routes its own endpoints however it likes, so [`USER_ID_PATH_TAGS`] - which finds a
+    /// user id by the segment in front of it - never sees these. Jellyfin Enhanced keeps its
+    /// per-user state behind exactly such paths, and an unreplaced proxy id arrives upstream as one
+    /// user's id carried by another user's token, which Jellyfin answers 403: settings that will
+    /// not save and tags that keep reverting.
+    #[tokio::test]
+    async fn a_plugin_path_carrying_the_proxy_user_id_is_remapped() {
+        let (processor, user, sessions) = user_mapping_fixture().await;
+
+        for (session, server) in sessions {
+            for template in [
+                "/JellyfinEnhanced/user-settings/{id}/settings.json",
+                "/JellyfinEnhanced/tag-cache/{id}",
+            ] {
+                let mut url = url::Url::parse(&format!(
+                    "http://localhost{}",
+                    template.replace("{id}", &user.id)
+                ))
+                .unwrap();
+                processor
+                    .client_to_server_url(&mut url, &Some(session.clone()), None, Some(server.id))
+                    .await;
+
+                assert_eq!(
+                    url.path(),
+                    template.replace("{id}", &session.original_user_id),
+                    "{template} must address the upstream user"
+                );
+            }
+        }
+    }
+
+    /// Only the requesting user's own proxy id is replaced. Another id-shaped segment belongs to
+    /// the plugin's own data, and assuming any id in an unknown path is a user reference would
+    /// corrupt it.
+    #[tokio::test]
+    async fn a_plugin_path_without_the_proxy_user_id_is_untouched() {
+        let (processor, _user, sessions) = user_mapping_fixture().await;
+        let (session, server) = sessions.into_iter().next().unwrap();
+
+        let path = "/JellyfinEnhanced/tag-cache/0123456789abcdef0123456789abcdef";
+        let mut url = url::Url::parse(&format!("http://localhost{path}")).unwrap();
+        processor
+            .client_to_server_url(&mut url, &Some(session), None, Some(server.id))
+            .await;
+
+        assert_eq!(
+            url.path(),
+            path,
+            "an id that is not this user's must pass through untouched"
+        );
+    }
+
+    /// The user id a proxied response hands back is the proxy's, so a client can legitimately place
+    /// it anywhere a plugin's API expects a user - including the last segment, and more than once.
+    /// It may also hold it in any UUID spelling, since normalisation is the proxy's convention and
+    /// not something a plugin knows about.
+    #[tokio::test]
+    async fn every_spelling_and_occurrence_of_the_proxy_user_id_is_replaced() {
+        let (processor, user, sessions) = user_mapping_fixture().await;
+        let (session, server) = sessions.into_iter().next().unwrap();
+
+        for id in uuid_variants(&user.id) {
+            let mut url =
+                url::Url::parse(&format!("http://localhost/JellyTweaks/{id}/peers/{id}")).unwrap();
+            processor
+                .client_to_server_url(&mut url, &Some(session.clone()), None, Some(server.id))
+                .await;
+
+            assert_eq!(
+                url.path(),
+                format!(
+                    "/JellyTweaks/{}/peers/{}",
+                    session.original_user_id, session.original_user_id
+                ),
+                "spelling {id} must still be recognised"
+            );
+        }
     }
 }
