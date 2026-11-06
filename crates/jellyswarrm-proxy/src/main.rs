@@ -847,6 +847,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "/MediaBar/{*path}",
                 any(handlers::web_client::plugin_asset_handler),
             )
+            // The tab list is a policy decision rather than an asset: it decides whose tabs a
+            // browser sees, so it is answered here instead of being relayed to one host.
+            .route(
+                "/CustomTabs/config",
+                any(handlers::custom_tabs::custom_tabs_config),
+            )
             .route(
                 "/CustomTabs/{*path}",
                 any(handlers::web_client::plugin_asset_handler),

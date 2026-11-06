@@ -360,6 +360,40 @@ fn default_library_view_sections() -> Vec<String> {
     vec!["mymedia".to_string()]
 }
 
+/// Where the tab list served at `/CustomTabs/config` comes from.
+///
+/// Custom Tabs stores its tabs per server, but a browser talks to one origin, so the proxy has to
+/// decide whose tabs are real. The default preserves the behaviour this replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CustomTabsMode {
+    /// Only the pinned client host's tabs. Tabs configured on any other server are invisible, with
+    /// nothing logged - which is why this is worth being able to change.
+    #[default]
+    Pinned,
+    /// Every server's tabs, concatenated and deduplicated by title.
+    Merged,
+    /// Only tabs defined on the proxy. Upstream tabs are ignored, so a tab can exist for people
+    /// coming through the proxy without existing for anyone connecting to a server directly.
+    Proxy,
+}
+
+/// A tab defined on the proxy rather than on a media server.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProxyCustomTab {
+    pub title: String,
+    #[serde(default)]
+    pub content_html: String,
+}
+
+fn default_custom_tabs_mode() -> CustomTabsMode {
+    CustomTabsMode::Pinned
+}
+
+fn default_custom_tabs() -> Vec<ProxyCustomTab> {
+    Vec::new()
+}
+
 /// Per-plugin federation policy.
 ///
 /// Client-side plugins keep their assets and their configuration on each media server, so every
@@ -368,6 +402,14 @@ fn default_library_view_sections() -> Vec<String> {
 /// does not require a rebuild, and makes the policy in force legible from the config file.
 #[derive(Debug, Clone, Deserialize, Serialize, DefaultFromSerde)]
 pub struct PluginFederationConfig {
+    #[serde(default = "default_custom_tabs_mode")]
+    pub custom_tabs_mode: CustomTabsMode,
+
+    /// Tabs owned by the proxy, used by [`CustomTabsMode::Proxy`] and appended by
+    /// [`CustomTabsMode::Merged`].
+    #[serde(default = "default_custom_tabs")]
+    pub custom_tabs: Vec<ProxyCustomTab>,
+
     #[serde(default = "default_plugin_asset_prefixes")]
     pub plugin_asset_prefixes: Vec<String>,
 
