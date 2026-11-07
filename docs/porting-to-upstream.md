@@ -1,6 +1,6 @@
 # Porting This Fork to a New Upstream Release
 
-This fork carries 22 commits on top of upstream `main`. This document is how to move them onto a
+This fork carries 27 commits on top of upstream `main`. This document is how to move them onto a
 new upstream release without re-introducing work upstream has since done itself.
 
 ## Strategy: fresh branch, replay selectively
@@ -91,6 +91,20 @@ Grouped by what each group is for, so a group can be evaluated as a unit.
 | `a005e20` | Add a Plugins page for managing plugins across servers |
 | `3a0cd51` | Make the plugin federation policy editable from the Plugins page |
 
+**Discovery and routing.** Built on the foundation above; evaluate as a unit, and only after
+deciding the foundation still applies.
+
+| | |
+| --- | --- |
+| `65efaf9` | Make the plugin asset policy govern what it describes |
+| `9ee38d1` | Discover plugin surfaces from the client the pinned host serves |
+| `2ef0811` | Show what the pinned client serves, and ask about the rest |
+| `81b1afb` | Let one plugin surface be answered by one named server |
+
+`65efaf9` is a prerequisite for the three after it: until the asset policy was consulted from the
+catch-all, a discovered prefix had no route to reach the handler that reads the policy, so nothing
+discovered at runtime could be served. Port it first or the rest does nothing.
+
 **Engine fixes upstream does not have.** These are not plugin work and each one is a silent
 correctness bug — check whether upstream fixed them, but do not drop them without checking.
 
@@ -101,8 +115,10 @@ correctness bug — check whether upstream fixed them, but do not drop them with
 | `e230adf` | Distinguish an unprobed server from a confirmed-offline one |
 | `a6f600a` | Report unusable credentials as 401 rather than 400 |
 
+`54df2c3` is this document and `docs/plugin-federation.md`; it carries no code.
+
 Each commit message states the mechanism and the symptom; read it before deciding the commit is
-cosmetic. Three of these four produce no error of any kind when they regress.
+cosmetic. Three of the four engine fixes produce no error of any kind when they regress.
 
 ## Hazards
 
@@ -152,7 +168,7 @@ cargo clippy --all-targets --all-features
 cargo test -p jellyswarrm-proxy
 ```
 
-At the time of writing: **477 tests**, clippy clean, fmt clean.
+At the time of writing: **513 tests**, clippy clean, fmt clean.
 
 Two practices worth keeping:
 
