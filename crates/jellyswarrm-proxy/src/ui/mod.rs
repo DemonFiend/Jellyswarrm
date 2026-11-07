@@ -170,6 +170,10 @@ pub fn ui_routes() -> axum::Router<AppState> {
         )
         .route("/plugins/surfaces/scan", post(admin::plugin_surfaces::scan))
         .route(
+            "/plugins/surfaces/route",
+            post(admin::plugin_surfaces::route),
+        )
+        .route(
             "/plugins/surfaces/classify",
             post(admin::plugin_surfaces::classify),
         )

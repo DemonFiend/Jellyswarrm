@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use axum::http;
 use http_body_util::BodyExt;
 use std::fmt;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::models::Authorization;
 use crate::processors::analyze_json;
@@ -771,6 +771,63 @@ async fn pinned_plugin_api_server(state: &AppState, request: &reqwest::Request) 
     web_client_server(state).await
 }
 
+/// The server an operator has explicitly routed this surface to.
+///
+/// Takes precedence over the web-client pin, and applies whether or not the path is in
+/// `plugin_api_prefixes`: an explicit route is its own authority, and requiring a surface to also
+/// be listed as a plugin API would make the setting silently conditional on another one.
+async fn routed_plugin_server(state: &AppState, request: &reqwest::Request) -> Option<Server> {
+    let routes = {
+        let config = state.config.read().await;
+        config.plugin_federation.plugin_server_routes.clone()
+    };
+    if routes.is_empty() {
+        return None;
+    }
+
+    let path = request.url().path();
+    // Longest prefix wins, so one endpoint of a plugin can be sent elsewhere than the rest of it.
+    let route = routes
+        .iter()
+        .filter(|route| {
+            crate::handlers::web_client::matches_plugin_prefix(
+                path,
+                std::slice::from_ref(&route.prefix),
+            )
+        })
+        .max_by_key(|route| route.prefix.len())?;
+
+    match state.server_storage.get_server_by_name(&route.server).await {
+        Ok(Some(server)) => {
+            debug!(
+                "Routing {path} to {} by the {} rule",
+                server.url, route.prefix
+            );
+            Some(server)
+        }
+        Ok(None) => {
+            warn!(
+                "Plugin route {} names server {:?}, which is not configured; using the default \
+                 policy instead",
+                route.prefix, route.server
+            );
+            None
+        }
+        Err(error) => {
+            error!("Could not look up server {:?}: {error}", route.server);
+            None
+        }
+    }
+}
+
+/// The server a plugin API request belongs to.
+async fn plugin_api_server(state: &AppState, request: &reqwest::Request) -> Option<Server> {
+    if let Some(routed) = routed_plugin_server(state, request).await {
+        return Some(routed);
+    }
+    pinned_plugin_api_server(state, request).await
+}
+
 pub async fn resolve_server(
     sessions: &Option<Vec<(AuthorizationSession, Server)>>,
     request_body_result: &Option<RequestBodyAnalysisResult>,
@@ -804,7 +861,7 @@ pub async fn resolve_server(
     // remapped and its ids rewritten - which is the difference between this and relaying it as an
     // asset. The playback-session branch above keeps precedence, so a misconfigured prefix can
     // never divert a playback report.
-    if let Some(pinned) = pinned_plugin_api_server(state, request).await {
+    if let Some(pinned) = plugin_api_server(state, request).await {
         if let Some(sessions) = sessions {
             if let Some((session, server)) = sessions.iter().find(|(_, s)| s.id == pinned.id) {
                 debug!("Pinning plugin API request to {}", server.url);
@@ -1061,6 +1118,184 @@ mod tests {
         matchers::{header, method, path, query_param},
         Mock, MockServer, ResponseTemplate,
     };
+
+    fn plugin_request(path: &str) -> reqwest::Request {
+        reqwest::Request::new(
+            reqwest::Method::GET,
+            format!("http://localhost{path}").parse().unwrap(),
+        )
+    }
+
+    async fn state_with_two_servers() -> AppState {
+        let state = create_test_app_state().await;
+        state
+            .server_storage
+            .add_server(
+                "Seerr Host",
+                "http://seerr.example",
+                1,
+                crate::config::MediaStreamingMode::Proxy,
+            )
+            .await
+            .unwrap();
+        state
+            .server_storage
+            .add_server(
+                "Client Host",
+                "http://client.example",
+                500,
+                crate::config::MediaStreamingMode::Proxy,
+            )
+            .await
+            .unwrap();
+
+        {
+            let mut config = state.config.write().await;
+            config.web_client_host = "http://client.example".to_string();
+            config.plugin_federation.plugin_api_prefixes = vec!["/JellyfinEnhanced".to_string()];
+        }
+
+        state
+    }
+
+    async fn set_routes(state: &AppState, routes: Vec<(&str, &str)>) {
+        state
+            .config
+            .write()
+            .await
+            .plugin_federation
+            .plugin_server_routes = routes
+            .into_iter()
+            .map(|(prefix, server)| crate::config::PluginServerRoute {
+                prefix: prefix.to_string(),
+                server: server.to_string(),
+            })
+            .collect();
+    }
+
+    /// An explicit route is an operator overriding the general policy, so it has to outrank the
+    /// web-client pin rather than merely fill a gap - and it must not drag the rest of the plugin
+    /// with it, since the point is to move one endpoint.
+    #[tokio::test]
+    async fn an_explicit_route_outranks_the_web_client_pin() {
+        let state = state_with_two_servers().await;
+        set_routes(&state, vec![("/JellyfinEnhanced/requests", "Seerr Host")]).await;
+
+        let routed = plugin_api_server(&state, &plugin_request("/JellyfinEnhanced/requests"))
+            .await
+            .expect("the route must resolve");
+        assert_eq!(routed.name, "Seerr Host");
+
+        let pinned = plugin_api_server(&state, &plugin_request("/JellyfinEnhanced/script"))
+            .await
+            .expect("the rest of the plugin still pins");
+        assert_eq!(
+            pinned.name, "Client Host",
+            "routing one endpoint must not move the whole plugin"
+        );
+    }
+
+    /// Longest prefix wins, so a namespace can have a destination and one endpoint inside it
+    /// another. Declaration order must not decide it.
+    #[tokio::test]
+    async fn the_longest_matching_prefix_decides() {
+        let state = state_with_two_servers().await;
+        set_routes(
+            &state,
+            vec![
+                ("/JellyfinEnhanced/requests", "Seerr Host"),
+                ("/JellyfinEnhanced", "Client Host"),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            plugin_api_server(&state, &plugin_request("/JellyfinEnhanced/requests"))
+                .await
+                .unwrap()
+                .name,
+            "Seerr Host"
+        );
+        assert_eq!(
+            plugin_api_server(&state, &plugin_request("/JellyfinEnhanced/script"))
+                .await
+                .unwrap()
+                .name,
+            "Client Host"
+        );
+    }
+
+    /// A route naming a server that has been renamed or removed must degrade to the default
+    /// policy. Failing the request instead would turn a stale setting into an outage.
+    #[tokio::test]
+    async fn a_route_naming_an_unknown_server_falls_back_to_the_default_policy() {
+        let state = state_with_two_servers().await;
+        set_routes(&state, vec![("/JellyfinEnhanced", "Server That Left")]).await;
+
+        let server = plugin_api_server(&state, &plugin_request("/JellyfinEnhanced/script"))
+            .await
+            .expect("the web-client pin still applies");
+
+        assert_eq!(server.name, "Client Host");
+    }
+
+    /// A route is its own authority. Requiring the path to also appear in `plugin_api_prefixes`
+    /// would make one setting silently conditional on another.
+    #[tokio::test]
+    async fn a_route_applies_to_a_surface_no_other_list_mentions() {
+        let state = state_with_two_servers().await;
+        set_routes(&state, vec![("/SomeOtherPlugin", "Seerr Host")]).await;
+
+        assert_eq!(
+            plugin_api_server(&state, &plugin_request("/SomeOtherPlugin/data"))
+                .await
+                .unwrap()
+                .name,
+            "Seerr Host"
+        );
+    }
+
+    /// Prefixes match on a segment boundary here as everywhere else, or `/Requests` would claim
+    /// `/RequestsArchive`.
+    #[tokio::test]
+    async fn a_route_prefix_matches_on_a_segment_boundary() {
+        let state = state_with_two_servers().await;
+        set_routes(&state, vec![("/Requests", "Seerr Host")]).await;
+
+        assert_eq!(
+            plugin_api_server(&state, &plugin_request("/Requests/pending"))
+                .await
+                .unwrap()
+                .name,
+            "Seerr Host"
+        );
+        assert!(
+            plugin_api_server(&state, &plugin_request("/RequestsArchive/pending"))
+                .await
+                .is_none(),
+            "a longer sibling route is a different route"
+        );
+    }
+
+    /// With no routes configured nothing changes, which is what every existing deployment has.
+    #[tokio::test]
+    async fn no_routes_leaves_the_default_policy_alone() {
+        let state = state_with_two_servers().await;
+
+        assert_eq!(
+            plugin_api_server(&state, &plugin_request("/JellyfinEnhanced/script"))
+                .await
+                .unwrap()
+                .name,
+            "Client Host"
+        );
+        assert!(
+            plugin_api_server(&state, &plugin_request("/Items"))
+                .await
+                .is_none(),
+            "an ordinary path is still not a plugin API call"
+        );
+    }
 
     async fn create_test_app_state() -> AppState {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();

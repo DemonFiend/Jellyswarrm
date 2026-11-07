@@ -58,8 +58,9 @@ The rule is that **presentation is pinned and media is federated**. A script, a 
 plugin's own configuration belongs to the origin that injected it; anything that returns media items
 belongs to every server and has to be merged, or that surface silently becomes single-server.
 
-`PluginFederationConfig` holds the policy. All five lists are editable from the Plugins page and
-match on path-segment boundaries, so `/MediaBarSomethingElse` is not swept up by `/MediaBar`.
+`PluginFederationConfig` holds the policy. It is all editable from the Plugins page, and every
+prefix matches on a path-segment boundary, so `/MediaBarSomethingElse` is not swept up by
+`/MediaBar`.
 
 | Field | Shipped default | Behaviour |
 | --- | --- | --- |
@@ -68,6 +69,7 @@ match on path-segment boundaries, so `/MediaBarSomethingElse` is not swept up by
 | `federated_plugin_api_prefixes` | `/JellyfinEnhanced/tag-cache`, `/JellyfinEnhanced/tag-data` | Fanned out to every server and merged |
 | `single_source_section_prefixes` | `discover`, `myjellyseerrrequests`, `jellyseerr`, `upcoming` | Answered by one server; merging is meaningless |
 | `library_view_sections` | `mymedia` | Resolved from the caller's merged library views |
+| `plugin_server_routes` | *(none)* | Sent to one named server, overriding the three above |
 
 The two pinning lists are different mechanisms and confusing them is the easy mistake. An **asset**
 prefix is relayed verbatim, which sends the *proxy's* own access token — fine for a static file,
@@ -75,7 +77,7 @@ wrong for anything that identifies the caller. An **API** prefix is pinned but g
 authorization remapping. Jellyfin Enhanced's endpoints identify the caller, which is why they are in
 the API list; pinning `/HomeScreen/Meta` as an asset is what failed.
 
-All five lists are live policy: the catch-all consults them on every request, so adding a prefix
+All of these are live policy: the catch-all consults them on every request, so adding a prefix
 pins a plugin surface immediately — no route to register, no rebuild, no restart. That is what makes
 the Plugins page able to enable a plugin the shipped defaults have never heard of.
 
@@ -94,6 +96,54 @@ highest-priority server's value so a payload's own `version` or format marker st
 Each leg gets `federated_leg_timeout` seconds (default 10) and a leg that fails is dropped with a
 warning rather than failing the request — the response is still useful, just missing one server's
 contribution.
+
+## Discovering surfaces
+
+The shipped policy names the plugins that existed when it was written, and Jellyfin's `/Plugins`
+endpoint cannot extend it: it reports a plugin's id, name, version and status but nothing about the
+routes it registers. The client document can, because File Transformation injects a `<script>` or
+`<link>` for every asset a plugin contributes.
+
+So a pass reads the pinned host's `/web/index.html`, resolves each reference against `/web/`, and
+pins anything no policy list covers yet. It runs at start-up and from **Scan the client again** on
+the Plugins page — the document is only read when asked, so a plugin installed since start-up is
+invisible until then.
+
+Three rules keep a pass from doing harm, and each has a test in `plugin_discovery`:
+
+- **Exact paths are pinned, never the namespace.** `/HomeScreen` holds both
+  `home-screen-sections.js` and `/HomeScreen/Sections`; the latter returns media items, so pinning
+  the namespace would reduce every home row to one server.
+- **All three lists are consulted, not just the asset list.** A path already classified as a plugin
+  API must not be re-classified as an asset, because an asset is relayed verbatim and so carries the
+  proxy's own token — wrong for anything that identifies the caller.
+- **A single-segment path belongs to no plugin.** `/favicon.ico` and `/manifest.json` are
+  site-level documents; a plugin surface is always `/Namespace/file`.
+
+An asset classifies itself — appearing in the document as a script or a stylesheet is what proves
+it is presentation. An endpoint a plugin only calls at runtime proves nothing, so its namespace is
+reported on the Plugins page for an operator to Pin or Merge instead of being guessed at.
+
+## Sending one surface to one server
+
+Pinning and merging answer "which server's copy of this plugin" and "all of them". Neither can say
+"that one" — and some integrations only exist on a single server. `plugin_server_routes` is that
+third answer, as `prefix = server name` pairs:
+
+```toml
+[[plugin_federation.plugin_server_routes]]
+prefix = "/JellyfinEnhanced/requests"
+server = "My Seerr Server"
+```
+
+An explicit route **outranks** `plugin_api_prefixes`, and applies whether or not the path appears in
+any other list: a route is its own authority, and requiring it to be listed twice would make one
+setting silently conditional on another. The **longest matching prefix wins**, so a plugin can go to
+one server while one of its endpoints goes to another.
+
+A route naming a server that no longer exists is ignored with a warning and the surface falls back
+to the default policy, so renaming or removing a server degrades rather than fails. The playback
+session branch still takes precedence over all of this, so no route can divert a playback report.
 
 ## What this does not do
 

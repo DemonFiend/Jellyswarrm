@@ -378,6 +378,23 @@ pub enum CustomTabsMode {
     Proxy,
 }
 
+/// Sends one plugin surface to a named server, whatever the general rules would do with it.
+///
+/// The three policies that apply by default answer three different questions - is this
+/// presentation, does it belong to the server that injected the script, does it report on media -
+/// and none of them can express "this particular endpoint belongs on that particular server". A
+/// Jellyseerr integration is the case that needs it: requests belong wherever Jellyseerr actually
+/// is, which is one server and not necessarily the one serving the client.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PluginServerRoute {
+    /// Path prefix, matched on a segment boundary. The longest matching prefix wins, so a
+    /// sub-path can be sent somewhere other than its namespace.
+    pub prefix: String,
+    /// A configured server's name. One that no longer exists is ignored with a warning, so
+    /// renaming or removing a server degrades to the default policy rather than failing requests.
+    pub server: String,
+}
+
 /// A tab defined on the proxy rather than on a media server.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProxyCustomTab {
@@ -424,6 +441,11 @@ pub struct PluginFederationConfig {
 
     #[serde(default = "default_library_view_sections")]
     pub library_view_sections: Vec<String>,
+
+    /// Explicit per-surface destinations. Take precedence over `plugin_api_prefixes`, which only
+    /// ever means "the server that serves the client".
+    #[serde(default)]
+    pub plugin_server_routes: Vec<PluginServerRoute>,
 }
 
 #[derive(Clone, Deserialize, Serialize, DefaultFromSerde)]

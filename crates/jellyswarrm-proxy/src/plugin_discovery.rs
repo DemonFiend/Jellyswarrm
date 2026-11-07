@@ -349,6 +349,8 @@ pub struct SurfaceStatus {
     /// Paths under this namespace that are federated regardless of the namespace's own policy -
     /// how Jellyfin Enhanced ends up pinned for its scripts and merged for its tag data.
     pub merged_paths: Vec<String>,
+    /// The server an explicit route sends this namespace to, overriding `data_policy`.
+    pub routed_server: Option<String>,
 }
 
 /// How the policy in force treats `namespace`.
@@ -376,6 +378,20 @@ fn merged_paths_under(namespace: &str, federation: &PluginFederationConfig) -> V
         .collect()
 }
 
+/// The server an explicit route sends `namespace` to, if one covers the namespace itself.
+///
+/// A route on a path *inside* the namespace is deliberately not reported here: it does not describe
+/// where the plugin goes, only where one of its endpoints does, and conflating the two would make
+/// the row say something false about the rest of the plugin.
+fn routed_server_for(namespace: &str, federation: &PluginFederationConfig) -> Option<String> {
+    federation
+        .plugin_server_routes
+        .iter()
+        .filter(|route| matches_plugin_prefix(namespace, std::slice::from_ref(&route.prefix)))
+        .max_by_key(|route| route.prefix.len())
+        .map(|route| route.server.clone())
+}
+
 /// Reads the client document and reports every surface against the policy in force.
 ///
 /// Read-only: it writes no configuration, so it is safe to call from a page load. Enabling assets
@@ -400,12 +416,59 @@ pub async fn survey(state: &AppState) -> Vec<SurfaceStatus> {
             SurfaceStatus {
                 data_policy: data_policy_for(&surface.namespace, &federation),
                 merged_paths: merged_paths_under(&surface.namespace, &federation),
+                routed_server: routed_server_for(&surface.namespace, &federation),
                 unpinned_assets,
                 namespace: surface.namespace,
                 assets: surface.assets,
             }
         })
         .collect()
+}
+
+/// Sends a plugin surface to a named server, or clears the route when `server` is empty.
+///
+/// The server is checked against the configured ones before saving, because the failure mode of a
+/// name that does not resolve is silent: the route is ignored at request time and the surface falls
+/// back to the default policy, which looks like the setting never took.
+pub async fn set_server_route(state: &AppState, prefix: &str, server: &str) -> Result<(), String> {
+    let prefix = prefix.trim();
+    if prefix.is_empty() || !prefix.starts_with('/') {
+        return Err(format!(
+            "{prefix:?} is not a path prefix; expected one starting with /"
+        ));
+    }
+    let server = server.trim();
+
+    if !server.is_empty() {
+        match state.server_storage.get_server_by_name(server).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(format!("No server named {server:?} is configured")),
+            Err(error) => return Err(format!("Could not check that server: {error}")),
+        }
+    }
+
+    let mut config_guard = state.config.write().await;
+    let mut updated = config_guard.clone();
+    let routes = &mut updated.plugin_federation.plugin_server_routes;
+
+    routes.retain(|route| !route.prefix.eq_ignore_ascii_case(prefix));
+    if !server.is_empty() {
+        routes.push(crate::config::PluginServerRoute {
+            prefix: prefix.to_string(),
+            server: server.to_string(),
+        });
+    }
+
+    save_config(&updated).map_err(|error| format!("Could not save the route: {error}"))?;
+    *config_guard = updated;
+
+    if server.is_empty() {
+        info!("Cleared the server route for {prefix}");
+    } else {
+        info!("Routed {prefix} to {server}");
+    }
+
+    Ok(())
 }
 
 /// Classifies a namespace's own endpoints.
@@ -827,6 +890,38 @@ mod tests {
         assert_eq!(
             merged_paths_under("/Tags", &federation),
             vec!["/Tags/data".to_string()]
+        );
+    }
+
+    /// A route on the namespace describes where the plugin goes; a route on a path inside it does
+    /// not, and must not be reported as though it did.
+    #[test]
+    fn only_a_route_covering_the_namespace_describes_the_namespace() {
+        let federation = PluginFederationConfig {
+            plugin_server_routes: vec![crate::config::PluginServerRoute {
+                prefix: "/JellyfinEnhanced/requests".to_string(),
+                server: "Seerr Host".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            routed_server_for("/JellyfinEnhanced", &federation),
+            None,
+            "one endpoint being routed says nothing about the plugin"
+        );
+
+        let federation = PluginFederationConfig {
+            plugin_server_routes: vec![crate::config::PluginServerRoute {
+                prefix: "/JellyfinEnhanced".to_string(),
+                server: "Seerr Host".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            routed_server_for("/JellyfinEnhanced", &federation),
+            Some("Seerr Host".to_string())
         );
     }
 }

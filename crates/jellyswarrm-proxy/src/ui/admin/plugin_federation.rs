@@ -17,7 +17,7 @@ use hyper::StatusCode;
 use tracing::error;
 
 use crate::{
-    config::{save_config, CustomTabsMode, ProxyCustomTab},
+    config::{save_config, CustomTabsMode, PluginServerRoute, ProxyCustomTab},
     AppState,
 };
 
@@ -34,6 +34,7 @@ pub struct PluginFederationTemplate {
     pub federated_plugin_api_prefixes: String,
     pub single_source_section_prefixes: String,
     pub library_view_sections: String,
+    pub plugin_server_routes: String,
     pub message: String,
 }
 
@@ -56,6 +57,34 @@ fn join_lines(values: &[String]) -> String {
     values.join("\n")
 }
 
+fn join_routes(routes: &[PluginServerRoute]) -> String {
+    routes
+        .iter()
+        .map(|route| format!("{} = {}", route.prefix, route.server))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parses `prefix = server` lines.
+///
+/// Newlines only, unlike [`parse_lines`]: a route is a pair, so splitting on commas would turn one
+/// mistyped line into two silently-wrong routes rather than one obviously-missing one. A line
+/// without an `=`, or with either half blank, is dropped - there is no sensible half of a route.
+pub fn parse_routes(value: &str) -> Vec<PluginServerRoute> {
+    value
+        .lines()
+        .filter_map(|line| {
+            let (prefix, server) = line.split_once('=')?;
+            let prefix = prefix.trim();
+            let server = server.trim();
+            (!prefix.is_empty() && !server.is_empty()).then(|| PluginServerRoute {
+                prefix: prefix.to_string(),
+                server: server.to_string(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct FederationForm {
     pub mode: CustomTabsMode,
@@ -65,6 +94,7 @@ pub struct FederationForm {
     pub federated_plugin_api_prefixes: Vec<String>,
     pub single_source_section_prefixes: Vec<String>,
     pub library_view_sections: Vec<String>,
+    pub plugin_server_routes: Vec<PluginServerRoute>,
 }
 
 /// Parses the settings form.
@@ -85,6 +115,7 @@ pub fn parse_federation_form(body: &str) -> FederationForm {
     let mut federated_plugin_api_prefixes = Vec::new();
     let mut single_source_section_prefixes = Vec::new();
     let mut library_view_sections = Vec::new();
+    let mut plugin_server_routes = Vec::new();
 
     for (key, value) in url::form_urlencoded::parse(body.as_bytes()) {
         match key.as_ref() {
@@ -106,6 +137,7 @@ pub fn parse_federation_form(body: &str) -> FederationForm {
                 single_source_section_prefixes = parse_lines(&value)
             }
             "library_view_sections" => library_view_sections = parse_lines(&value),
+            "plugin_server_routes" => plugin_server_routes = parse_routes(&value),
             _ => {}
         }
     }
@@ -128,6 +160,7 @@ pub fn parse_federation_form(body: &str) -> FederationForm {
         federated_plugin_api_prefixes,
         single_source_section_prefixes,
         library_view_sections,
+        plugin_server_routes,
     }
 }
 
@@ -158,6 +191,7 @@ async fn render(state: &AppState, message: String) -> Response {
         federated_plugin_api_prefixes: join_lines(&federation.federated_plugin_api_prefixes),
         single_source_section_prefixes: join_lines(&federation.single_source_section_prefixes),
         library_view_sections: join_lines(&federation.library_view_sections),
+        plugin_server_routes: join_routes(&federation.plugin_server_routes),
         message,
     };
 
@@ -201,6 +235,7 @@ pub async fn save_federation(State(state): State<AppState>, body: String) -> Res
         updated.plugin_federation.single_source_section_prefixes =
             form.single_source_section_prefixes;
         updated.plugin_federation.library_view_sections = form.library_view_sections;
+        updated.plugin_federation.plugin_server_routes = form.plugin_server_routes;
 
         match save_config(&updated) {
             Ok(()) => {
@@ -390,6 +425,77 @@ mod tests {
         assert_eq!(
             form.tabs[0].content_html,
             r#"<iframe src="https://example.com"></iframe>"#
+        );
+    }
+}
+
+#[cfg(test)]
+mod plugin_route_form_tests {
+    use super::*;
+
+    #[test]
+    fn routes_are_parsed_as_pairs_and_round_trip() {
+        let routes =
+            parse_routes("/JellyfinEnhanced/requests = Seerr Host\n  /Discover=Other Server  \n\n");
+
+        assert_eq!(
+            routes,
+            vec![
+                PluginServerRoute {
+                    prefix: "/JellyfinEnhanced/requests".to_string(),
+                    server: "Seerr Host".to_string(),
+                },
+                PluginServerRoute {
+                    prefix: "/Discover".to_string(),
+                    server: "Other Server".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            parse_routes(&join_routes(&routes)),
+            routes,
+            "what the form shows must parse back to what it was given"
+        );
+    }
+
+    /// A server name may contain a comma, and a route is a pair rather than a list, so the
+    /// comma-splitting that the prefix fields need would corrupt these.
+    #[test]
+    fn a_comma_in_a_server_name_does_not_split_a_route() {
+        assert_eq!(
+            parse_routes("/Discover = Bob's Server, Media"),
+            vec![PluginServerRoute {
+                prefix: "/Discover".to_string(),
+                server: "Bob's Server, Media".to_string(),
+            }]
+        );
+    }
+
+    /// There is no sensible half of a route, so an incomplete line is dropped rather than saved as
+    /// something that would silently never match.
+    #[test]
+    fn incomplete_lines_are_dropped() {
+        assert!(parse_routes("/JustAPrefix").is_empty());
+        assert!(parse_routes("= Just A Server").is_empty());
+        assert!(parse_routes("/Prefix =").is_empty());
+        assert!(parse_routes("   ").is_empty());
+    }
+
+    /// The whole form must survive a round trip, or saving one field would clear this one.
+    #[test]
+    fn the_form_carries_routes_through_a_submission() {
+        let body = "custom_tabs_mode=pinned\
+                    &plugin_asset_prefixes=%2FMediaBar\
+                    &plugin_server_routes=%2FDiscover+%3D+Seerr+Host";
+
+        let form = parse_federation_form(body);
+
+        assert_eq!(
+            form.plugin_server_routes,
+            vec![PluginServerRoute {
+                prefix: "/Discover".to_string(),
+                server: "Seerr Host".to_string(),
+            }]
         );
     }
 }

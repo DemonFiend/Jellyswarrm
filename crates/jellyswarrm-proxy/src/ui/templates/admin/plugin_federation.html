@@ -98,6 +98,28 @@
     </label>
   </fieldset>
 
+  <fieldset>
+    <legend><strong>Plugin routes</strong></legend>
+    <small>
+      Sends one surface to one named server, overriding everything above it. For an integration
+      that only exists on a single server &mdash; the one that actually talks to Jellyseerr, for
+      instance &mdash; rather than on whichever server serves the web client.
+    </small>
+
+    <label>Routes
+      <textarea name="plugin_server_routes" rows="4"
+                placeholder="/JellyfinEnhanced/requests = My Seerr Server">{{ plugin_server_routes }}</textarea>
+      <small>
+        One <code>prefix = server name</code> per line. Matched on a path-segment boundary, and the
+        <strong>longest matching prefix wins</strong> &mdash; so a whole plugin can go to one server
+        while one of its endpoints goes to another. A name that no longer matches a configured
+        server is ignored and that surface falls back to the policy above, so renaming a server
+        degrades rather than breaks. Most plugins need nothing here; the selector on the
+        <em>Client-side plugins</em> table above writes the common case for you.
+      </small>
+    </label>
+  </fieldset>
+
   <div style="display:flex; gap:.5rem;">
     <button type="submit">Save</button>
     <button type="button" hx-get="/{{ ui_route }}/plugins/federation" hx-target="#plugin-federation" class="secondary">Reset</button>

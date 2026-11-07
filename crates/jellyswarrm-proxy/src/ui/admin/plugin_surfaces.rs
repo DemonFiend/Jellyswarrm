@@ -30,6 +30,8 @@ pub struct PluginSurfacesTemplate {
     pub surfaces: Vec<SurfaceView>,
     pub any_surfaces: bool,
     pub unclassified_count: usize,
+    /// Configured server names, for the destination selector.
+    pub servers: Vec<String>,
     pub message: String,
 }
 
@@ -45,6 +47,9 @@ pub struct SurfaceView {
     pub unclassified: bool,
     pub merged_paths: Vec<String>,
     pub any_merged_paths: bool,
+    /// The server an explicit route sends this plugin to; empty when the default policy applies.
+    pub routed_server: String,
+    pub routed: bool,
 }
 
 async fn render(state: &AppState, message: String) -> Response {
@@ -66,6 +71,8 @@ async fn render(state: &AppState, message: String) -> Response {
                 policy_label: status.data_policy.label().to_string(),
                 unclassified: status.data_policy == DataPolicy::Unclassified,
                 any_merged_paths: !status.merged_paths.is_empty(),
+                routed: status.routed_server.is_some(),
+                routed_server: status.routed_server.unwrap_or_default(),
                 namespace: status.namespace,
                 assets: status.assets,
                 unpinned: status.unpinned_assets,
@@ -76,9 +83,18 @@ async fn render(state: &AppState, message: String) -> Response {
         Vec::new()
     };
 
+    let servers = match state.server_storage.list_servers().await {
+        Ok(servers) => servers.into_iter().map(|server| server.name).collect(),
+        Err(error) => {
+            error!("Could not list servers for the destination selector: {error}");
+            Vec::new()
+        }
+    };
+
     let template = PluginSurfacesTemplate {
         ui_route,
         host_configured,
+        servers,
         unclassified_count: surfaces.iter().filter(|s| s.unclassified).count(),
         any_surfaces: !surfaces.is_empty(),
         surfaces,
@@ -134,6 +150,31 @@ pub async fn scan(State(state): State<AppState>) -> Response {
                 outcome.surfaces.len()
             ),
         )
+    };
+
+    render(&state, message).await
+}
+
+#[derive(Deserialize)]
+pub struct RouteForm {
+    pub prefix: String,
+    /// Empty means "remove the route and use the default policy".
+    pub server: String,
+}
+
+/// `POST /{ui}/plugins/surfaces/route` — send one surface to a named server.
+pub async fn route(State(state): State<AppState>, Form(form): Form<RouteForm>) -> Response {
+    let message = match plugin_discovery::set_server_route(&state, &form.prefix, &form.server).await
+    {
+        Ok(()) if form.server.trim().is_empty() => alert(
+            "success",
+            &format!("{} now follows the default policy again.", form.prefix),
+        ),
+        Ok(()) => alert(
+            "success",
+            &format!("{} is now answered by {}.", form.prefix, form.server),
+        ),
+        Err(error) => alert("error", &format!("Not saved: {error}")),
     };
 
     render(&state, message).await
