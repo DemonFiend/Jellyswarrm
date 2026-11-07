@@ -42,7 +42,8 @@ Jellyswarrm is a reverse proxy that lets you combine multiple Jellyfin servers i
 * **User Mapping** – Link accounts across servers for a consistent user experience.
 * **API Compatibility** – Appears as a normal Jellyfin server, so existing apps and tools still work.
 * **Server Federation** – Automatically sync users across connected servers.
-* **User Page** – Personal dashboard for managing credentials and libraries. 
+* **User Page** – Personal dashboard for managing credentials and libraries.
+* **Client-Side Plugins** – Serve the web client from one of your servers so the plugins it injects (Media Bar, Home Screen Sections, Plugin Pages, Custom Tabs, Jellyfin Enhanced) work through the proxy, with per-plugin control over which surfaces are pinned to one server and which are merged across all of them.
 
 ### ⚠️ In Progress
 
@@ -85,6 +86,8 @@ Once the container is running, open:
 For advanced configuration options, check out the [ui](./docs/ui.md) and [configuration](./docs/config.md) documentation.
 
 For `/health`, `/ready`, and Docker health check details, see the [health monitoring documentation](./docs/health-monitoring.md).
+
+To make a server's client-side plugins work through the proxy, see the [plugin federation documentation](./docs/plugin-federation.md). Nothing client-side works until `web_client_host` is set, and an unset value is indistinguishable from the plugins being broken.
 
 ---
 
@@ -163,4 +166,7 @@ The build process is streamlined thanks to the included [`build.rs`](./crates/je
    Most likely! Jellyswarrm presents itself as a standard Jellyfin server, so most clients should work out of the box. That said, not every Jellyfin client has been tested, so a few may have issues.  
 
 3. **Why use Jellyswarrm instead of mounting a remote library via e.g. SMB?**  
-   Jellyswarrm is built to **connect your servers with your friends’ servers** across different networks. Setting up SMB in these cases can be complicated, and performance is often worse. With Jellyswarrm, content is streamed directly from the original server, so all the heavy lifting (like transcoding) happens where the media actually lives.  
+   Jellyswarrm is built to **connect your servers with your friends’ servers** across different networks. Setting up SMB in these cases can be complicated, and performance is often worse. With Jellyswarrm, content is streamed directly from the original server, so all the heavy lifting (like transcoding) happens where the media actually lives.
+
+4. **Do Jellyfin plugins work through Jellyswarrm?**
+   Server-side plugins (metadata providers, Intro Skipper, and so on) run on their own server and are unaffected. Plugins that add something to the *web interface* need [`web_client_host`](./docs/plugin-federation.md) pointed at a server that has them installed, because Jellyswarrm serves its own copy of the web client and nothing injects into it. Once that is set, a plugin's scripts and configuration come from that server while its media queries are still merged across every server.
