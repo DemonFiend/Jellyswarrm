@@ -14,6 +14,21 @@
     </div>
 </section>
 
+<details style="margin-top:2rem;" open>
+    <summary><strong>Client-side plugins</strong> &mdash; what the pinned web client actually serves</summary>
+    <p>
+        A plugin that adds something to the web interface only reaches a browser if the web client
+        comes from a server that has it installed. These are the surfaces that client references,
+        and how Jellyswarrm answers each one.
+    </p>
+    <section id="plugin-surfaces" hx-get="/{{ ui_route }}/plugins/surfaces" hx-trigger="load">
+        <div class="library-board-loading" aria-live="polite">
+            <i class="fas fa-circle-notch fa-spin" aria-hidden="true"></i>
+            <span>Reading the pinned web client&hellip;</span>
+        </div>
+    </section>
+</details>
+
 <details style="margin-top:2rem;">
     <summary><strong>Federation</strong> &mdash; how per-server plugin settings are combined</summary>
     <p>

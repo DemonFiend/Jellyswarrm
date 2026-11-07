@@ -164,6 +164,15 @@ pub fn ui_routes() -> axum::Router<AppState> {
             get(admin::plugin_federation::federation_form)
                 .post(admin::plugin_federation::save_federation),
         )
+        .route(
+            "/plugins/surfaces",
+            get(admin::plugin_surfaces::surfaces_fragment),
+        )
+        .route("/plugins/surfaces/scan", post(admin::plugin_surfaces::scan))
+        .route(
+            "/plugins/surfaces/classify",
+            post(admin::plugin_surfaces::classify),
+        )
         .route("/plugins/restart", post(admin::plugins::restart_pending))
         .route(
             "/plugins/repositories",

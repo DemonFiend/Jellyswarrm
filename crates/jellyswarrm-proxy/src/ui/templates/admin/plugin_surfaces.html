@@ -1,0 +1,124 @@
+<div id="plugin-surfaces-messages">{{ message|safe }}</div>
+
+{% if host_configured %}
+
+<p>
+  Read from the client document the pinned server actually serves. A plugin's scripts and
+  stylesheets are pinned for you &mdash; appearing there as a script or a stylesheet is what proves
+  they are presentation. What a plugin asks <em>Jellyfin</em> for is already merged across every
+  server. What it asks <em>itself</em> for is the decision below.
+</p>
+
+<form hx-post="/{{ ui_route }}/plugins/surfaces/scan"
+      hx-target="#plugin-surfaces" hx-swap="innerHTML" hx-disabled-elt="find button">
+  <button type="submit"><i class="fas fa-rotate" aria-hidden="true"></i> Scan the client again</button>
+  <small>
+    The client is read once at start-up, so a plugin installed since then is not here yet. Restart
+    the media server after installing one, or its web client will not be serving the plugin either.
+  </small>
+</form>
+
+{% if any_surfaces %}
+
+{% if unclassified_count > 0 %}
+<p class="alert alert-error">
+  {{ unclassified_count }} plugin(s) have endpoints of their own that no policy covers. Their assets
+  work, so the plugin will load; its data is going through ordinary federation, which may or may not
+  be what that plugin expects.
+</p>
+{% endif %}
+
+<table>
+  <thead>
+    <tr>
+      <th>Plugin</th>
+      <th>Assets</th>
+      <th>Its own endpoints</th>
+      <th>Answer them</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for surface in surfaces %}
+    <tr>
+      <td><code>{{ surface.namespace }}</code></td>
+      <td>
+        <details>
+          <summary>{{ surface.asset_count }} referenced</summary>
+          <ul>
+            {% for asset in surface.assets %}
+            <li><code>{{ asset }}</code></li>
+            {% endfor %}
+          </ul>
+        </details>
+        {% if surface.any_unpinned %}
+        <small>
+          <strong>Not pinned yet:</strong>
+          {% for asset in surface.unpinned %}<code>{{ asset }}</code> {% endfor %}
+          &mdash; run a scan.
+        </small>
+        {% endif %}
+      </td>
+      <td>
+        {{ surface.policy_label }}
+        {% if surface.any_merged_paths %}
+        <small>
+          Merged whatever this says:
+          {% for path in surface.merged_paths %}<code>{{ path }}</code> {% endfor %}
+        </small>
+        {% endif %}
+      </td>
+      <td>
+        <form hx-post="/{{ ui_route }}/plugins/surfaces/classify"
+              hx-target="#plugin-surfaces" hx-swap="innerHTML" hx-disabled-elt="find button">
+          <input type="hidden" name="namespace" value="{{ surface.namespace }}">
+          <button type="submit" name="policy" value="pinned"
+                  title="Only the server that serves the web client answers these.">
+            Pin
+          </button>
+          <button type="submit" name="policy" value="merged"
+                  title="Ask every server and merge the answers. Correct when the endpoint reports on media.">
+            Merge
+          </button>
+          {% if surface.unclassified %}{% else %}
+          <button type="submit" name="policy" value="unclassified"
+                  title="Remove the policy and let these take the ordinary federated path.">
+            Clear
+          </button>
+          {% endif %}
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<small>
+  <strong>Pin</strong> suits anything that belongs to one server's copy of a plugin &mdash; its
+  configuration, or an endpoint that identifies the caller. <strong>Merge</strong> suits anything
+  that reports on media, because one server only knows about its own. Pinning something that
+  reports on media is the mistake worth avoiding: nothing errors, the page simply shows part of the
+  catalogue.
+</small>
+
+{% else %}
+
+<p>
+  <strong>No plugin assets found in the client.</strong> Either the pinned server has no
+  client-side plugin installed, or
+  <a href="https://github.com/IAmParadox27/jellyfin-plugin-file-transformation">File
+  Transformation</a> is not injecting into its web client &mdash; it is what every one of these
+  plugins uses to get into the page, and it has to be installed and the server restarted.
+</p>
+
+{% endif %}
+
+{% else %}
+
+<p>
+  No web client host is set, so there is no client document to read &mdash; and no client-side
+  plugin reaches a browser at all, because Jellyswarrm serves its own copy of the web client and
+  nothing injects into it. Set a host on the
+  <a href="/{{ ui_route }}/settings">Settings</a> page first.
+</p>
+
+{% endif %}

@@ -313,6 +313,145 @@ pub async fn discover_and_enable_assets(state: &AppState) -> DiscoveryOutcome {
     }
 }
 
+/// How the policy treats a plugin's own endpoints - as distinct from its assets, which the client
+/// document can classify by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataPolicy {
+    /// Answered by the server that served the client.
+    Pinned,
+    /// Fanned out to every server and merged.
+    Merged,
+    /// No policy of its own, so its endpoints take the ordinary federated path.
+    Unclassified,
+}
+
+impl DataPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pinned => "Pinned to the web client host",
+            Self::Merged => "Merged across all servers",
+            Self::Unclassified => "Not classified",
+        }
+    }
+}
+
+/// A discovered surface, reported against the policy currently in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceStatus {
+    pub namespace: String,
+    /// Every asset path the client document references under this namespace.
+    pub assets: Vec<String>,
+    /// Those with no policy yet. Empty once a pass has run, so a non-empty list means the pinned
+    /// host changed since the last pass or saving the policy failed.
+    pub unpinned_assets: Vec<String>,
+    /// How this namespace's own endpoints are treated.
+    pub data_policy: DataPolicy,
+    /// Paths under this namespace that are federated regardless of the namespace's own policy -
+    /// how Jellyfin Enhanced ends up pinned for its scripts and merged for its tag data.
+    pub merged_paths: Vec<String>,
+}
+
+/// How the policy in force treats `namespace`.
+fn data_policy_for(namespace: &str, federation: &PluginFederationConfig) -> DataPolicy {
+    if matches_plugin_prefix(namespace, &federation.federated_plugin_api_prefixes) {
+        DataPolicy::Merged
+    } else if matches_plugin_prefix(namespace, &federation.plugin_api_prefixes) {
+        DataPolicy::Pinned
+    } else {
+        DataPolicy::Unclassified
+    }
+}
+
+/// Federated prefixes that live under `namespace`.
+fn merged_paths_under(namespace: &str, federation: &PluginFederationConfig) -> Vec<String> {
+    federation
+        .federated_plugin_api_prefixes
+        .iter()
+        .filter(|prefix| {
+            prefix.len() > namespace.len()
+                && prefix.as_bytes()[namespace.len()] == b'/'
+                && prefix[..namespace.len()].eq_ignore_ascii_case(namespace)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Reads the client document and reports every surface against the policy in force.
+///
+/// Read-only: it writes no configuration, so it is safe to call from a page load. Enabling assets
+/// is [`discover_and_enable_assets`], which runs at start-up and from an explicit action.
+pub async fn survey(state: &AppState) -> Vec<SurfaceStatus> {
+    let Some(html) = fetch_client_html(state).await else {
+        return Vec::new();
+    };
+
+    let federation = state.config.read().await.plugin_federation.clone();
+
+    surfaces_in_client_html(&html)
+        .into_iter()
+        .map(|surface| {
+            let unpinned_assets = surface
+                .assets
+                .iter()
+                .filter(|asset| !already_classified(asset, &federation))
+                .cloned()
+                .collect();
+
+            SurfaceStatus {
+                data_policy: data_policy_for(&surface.namespace, &federation),
+                merged_paths: merged_paths_under(&surface.namespace, &federation),
+                unpinned_assets,
+                namespace: surface.namespace,
+                assets: surface.assets,
+            }
+        })
+        .collect()
+}
+
+/// Classifies a namespace's own endpoints.
+///
+/// Additive: the namespace is appended to whichever list the operator chose and removed from the
+/// other, so repeating a choice is a no-op and changing one's mind takes effect. Assets are
+/// untouched - they are classified by the document, not by this.
+pub async fn classify_namespace(
+    state: &AppState,
+    namespace: &str,
+    policy: DataPolicy,
+) -> Result<(), String> {
+    let namespace = namespace.trim();
+    if namespace.is_empty() || !namespace.starts_with('/') || namespace[1..].contains('/') {
+        return Err(format!(
+            "{namespace:?} is not a plugin namespace; expected a single leading segment such as              /MediaBar"
+        ));
+    }
+
+    let mut config_guard = state.config.write().await;
+    let mut updated = config_guard.clone();
+    let federation = &mut updated.plugin_federation;
+
+    let drop_from = |list: &mut Vec<String>| {
+        list.retain(|existing| !existing.eq_ignore_ascii_case(namespace));
+    };
+
+    drop_from(&mut federation.plugin_api_prefixes);
+    drop_from(&mut federation.federated_plugin_api_prefixes);
+
+    match policy {
+        DataPolicy::Pinned => federation.plugin_api_prefixes.push(namespace.to_string()),
+        DataPolicy::Merged => federation
+            .federated_plugin_api_prefixes
+            .push(namespace.to_string()),
+        // Leaving it unclassified is the absence of both entries, which the removals above achieve.
+        DataPolicy::Unclassified => {}
+    }
+
+    save_config(&updated).map_err(|error| format!("Could not save the policy: {error}"))?;
+    *config_guard = updated;
+    info!("Classified {namespace} as {}", policy.label());
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,5 +776,57 @@ mod tests {
                 "{data_path} must never become a pinned asset"
             );
         }
+    }
+
+    /// Enhanced is the shape that makes a single label per namespace insufficient: its scripts are
+    /// pinned to the client host while its tag data is merged across servers, so the report has to
+    /// show both.
+    #[test]
+    fn a_namespace_can_be_pinned_while_paths_under_it_are_merged() {
+        let federation = PluginFederationConfig::default();
+
+        assert_eq!(
+            data_policy_for("/JellyfinEnhanced", &federation),
+            DataPolicy::Pinned
+        );
+        assert_eq!(
+            merged_paths_under("/JellyfinEnhanced", &federation),
+            vec![
+                "/JellyfinEnhanced/tag-cache".to_string(),
+                "/JellyfinEnhanced/tag-data".to_string(),
+            ]
+        );
+    }
+
+    /// A plugin whose assets are pinned but whose endpoints have no policy must read as
+    /// unclassified, because that is the decision an operator is being asked for.
+    #[test]
+    fn an_asset_only_namespace_is_unclassified() {
+        let federation = PluginFederationConfig::default();
+
+        // MediaBar's assets are pinned by the shipped policy, but it has no API entry.
+        assert_eq!(
+            data_policy_for("/MediaBar", &federation),
+            DataPolicy::Unclassified
+        );
+        assert!(merged_paths_under("/MediaBar", &federation).is_empty());
+    }
+
+    /// A namespace must not be reported as merged because some unrelated prefix merely starts with
+    /// the same letters.
+    #[test]
+    fn merged_paths_match_on_a_segment_boundary() {
+        let federation = PluginFederationConfig {
+            federated_plugin_api_prefixes: vec![
+                "/Tags/data".to_string(),
+                "/TagsExtra/data".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            merged_paths_under("/Tags", &federation),
+            vec!["/Tags/data".to_string()]
+        );
     }
 }
