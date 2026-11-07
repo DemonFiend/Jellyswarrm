@@ -1043,6 +1043,12 @@ async fn index_handler(
 
 // Only expose actionable validation messages; database and transport details stay in logs.
 fn client_request_error(error: &anyhow::Error) -> &'static str {
+    if error
+        .downcast_ref::<request_preprocessing::NoAuthorizationSessions>()
+        .is_some()
+    {
+        return "Authentication is required, or the session is no longer valid";
+    }
     let message = error.to_string();
     if message.contains("mixed-server playlists are unsupported") {
         "Playlist track or entry is unavailable on the selected server; mixed-server playlists are unsupported"
@@ -1195,7 +1201,8 @@ async fn proxy_handler(
         Ok(request) => request,
         Err(error) => {
             error!("Failed to preprocess request: {}", error);
-            return Ok((StatusCode::BAD_REQUEST, client_request_error(&error)).into_response());
+            let status = extractors::preprocess_failure_status(&error);
+            return Ok((status, client_request_error(&error)).into_response());
         }
     };
 

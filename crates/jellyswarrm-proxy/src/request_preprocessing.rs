@@ -371,6 +371,15 @@ pub async fn extract_request_infos(
     Ok((request, auth, user, sessions, request_body_result))
 }
 
+/// The request presented credentials that resolve to no usable session.
+///
+/// A distinct type rather than a message, because the correct HTTP status differs and callers must
+/// be able to tell this apart from a request that was genuinely malformed. See
+/// [`crate::extractors::preprocess_failure_status`] for why that distinction matters to clients.
+#[derive(Debug, thiserror::Error)]
+#[error("no authorization sessions available")]
+pub struct NoAuthorizationSessions;
+
 pub async fn preprocess_request(req: Request, state: &AppState) -> Result<PreprocessedRequest> {
     debug!("Preprocessing request: {:?}", req.uri());
     let method = req.method().clone();
@@ -660,9 +669,7 @@ async fn resolve_playback_report_server(
     analysis: &RequestBodyAnalysisResult,
     state: &AppState,
 ) -> Result<(Server, Option<AuthorizationSession>, bool)> {
-    let sessions = sessions
-        .as_ref()
-        .ok_or_else(|| anyhow!("no authorization sessions available"))?;
+    let sessions = sessions.as_ref().ok_or(NoAuthorizationSessions)?;
     let item_id = analysis
         .requested_play_item_id
         .as_deref()
@@ -852,13 +859,13 @@ pub async fn resolve_server(
         }
 
         let Some((session, server)) = sessions.first() else {
-            return Err(anyhow!("no authorization sessions available"));
+            return Err(NoAuthorizationSessions.into());
         };
         return Ok((server.clone(), Some(session.clone()), false));
     }
 
     if access_scope.is_some() {
-        return Err(anyhow!("no authorization sessions available"));
+        return Err(NoAuthorizationSessions.into());
     }
 
     if let Some(request_server) = request_server {
