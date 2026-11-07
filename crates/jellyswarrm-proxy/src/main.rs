@@ -4,7 +4,7 @@ use axum::{
     http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{any, get, post},
+    routing::{any, get, post, MethodRouter},
     Router,
 };
 
@@ -828,15 +828,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "/HomeScreen/Section/{sectiontype}",
                 get(handlers::home_screen::get_home_screen_section),
             )
-            // The client application, pinned to one origin. Registered ahead of the
-            // catch-all so asset requests never reach the per-request server resolution
-            // that lets one page load draw its index.html and its chunks from two
-            // different servers. With no pinned host these defer back to the catch-all.
-            .route("/web", any(handlers::web_client::web_client_handler))
-            .route(
-                "/web/{*path}",
-                any(handlers::web_client::web_client_handler),
-            )
+            // The client application, pinned to one origin. Merged ahead of the catch-all so
+            // asset requests never reach the per-request server resolution that lets one page
+            // load draw its index.html and its chunks from two different servers. With no pinned
+            // host these defer back to the catch-all. All three patterns are already lowercase,
+            // so merging them rather than listing them here costs nothing.
+            .merge(web_client_routes(any(
+                handlers::web_client::web_client_handler,
+            )))
             // Plugin asset and configuration surfaces, pinned to the same origin as the
             // client that requests them. Section *data* is deliberately absent: those
             // endpoints return media items and have to federate across servers.
@@ -1054,6 +1053,36 @@ fn client_request_error(error: &anyhow::Error) -> &'static str {
     } else {
         "Invalid proxy request"
     }
+}
+
+/// Every route that serves the browser's client application from the pinned origin.
+///
+/// Built here, parameterised over the handler, so that a test can assemble the same routes with a
+/// marker handler and assert what actually matches. Listing them inline in the router instead
+/// leaves a test no choice but to restate the patterns, and a restated pattern cannot notice one
+/// going missing.
+///
+/// `/web/` needs an entry of its own. A catch-all does not match an empty remainder and `/web`
+/// does not match `/web/`, so the other two patterns leave the trailing-slash form to the
+/// fallback - and that is the form clients actually request: it is where [`web_root_redirect`]
+/// sends a browser, and what Jellyfin Media Player loads. Falling through served the client
+/// embedded in the proxy while `/web/*.bundle.js` was still relayed from the pinned host, so a
+/// single page load drew `index.html` from one build and its JavaScript from another. Nothing
+/// 404s, because jellyfin-web keeps its build hash in the query string and the filenames are
+/// identical across builds; the page simply comes up with none of the plugin scripts the pinned
+/// host injects. It survives a hard reload, it affects native clients too, and it cannot be
+/// reproduced by requesting `/web/index.html`, which matches the catch-all and is relayed
+/// correctly - so every obvious way of checking it says the proxy is fine.
+///
+/// [`web_root_redirect`]: handlers::web_client::web_root_redirect
+fn web_client_routes<S>(handler: MethodRouter<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/web", handler.clone())
+        .route("/web/", handler.clone())
+        .route("/web/{*path}", handler)
 }
 
 #[axum::debug_handler]
@@ -1334,6 +1363,67 @@ async fn shutdown_signal(deletion_task_abort_handle: AbortHandle) {
     tokio::select! {
         _ = ctrl_c => { deletion_task_abort_handle.abort() },
         _ = terminate => { deletion_task_abort_handle.abort() },
+    }
+}
+
+#[cfg(test)]
+mod web_client_route_tests {
+    use axum::{body::Body, http::Request, routing::any, Router};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    async fn which_handler(app: Router, path: &str) -> String {
+        let response = app
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// The real routes from [`super::web_client_routes`], with a marker handler standing in for
+    /// the relay, so that what is under test is the registration the router actually performs
+    /// rather than a copy of it restated here.
+    fn client_routes() -> Router {
+        super::web_client_routes(any(|| async { "pinned" })).fallback(|| async { "embedded" })
+    }
+
+    /// Every way into the client application has to reach the pinned host. Serving any one of
+    /// these from the embedded bundle instead mixes two builds into a single page load: the
+    /// filenames are identical across builds because jellyfin-web keeps its build hash in the
+    /// query string, so nothing 404s and nothing is logged - the page simply comes up without the
+    /// plugin scripts the pinned host injects.
+    #[tokio::test]
+    async fn every_entry_point_to_the_client_is_pinned() {
+        for path in [
+            "/web",
+            "/web/",
+            "/web/index.html",
+            "/web/main.jellyfin.bundle.js",
+        ] {
+            assert_eq!(
+                which_handler(client_routes(), path).await,
+                "pinned",
+                "{path} must be served by the pinned client host"
+            );
+        }
+    }
+
+    /// The matcher behaviour that caused the defect, asserted directly so it cannot quietly come
+    /// back if the explicit `/web/` route is ever tidied away as redundant.
+    #[tokio::test]
+    async fn a_catch_all_does_not_cover_the_trailing_slash_by_itself() {
+        let without_explicit_route = Router::new()
+            .route("/web", any(|| async { "pinned" }))
+            .route("/web/{*path}", any(|| async { "pinned" }))
+            .fallback(|| async { "embedded" });
+
+        assert_eq!(
+            which_handler(without_explicit_route, "/web/").await,
+            "embedded",
+            "if this starts returning \"pinned\", axum's matcher has changed and the explicit \
+             /web/ route is no longer what keeps the client on one origin"
+        );
     }
 }
 
