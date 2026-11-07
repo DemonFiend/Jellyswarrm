@@ -41,6 +41,7 @@ mod media_catalog;
 mod media_identity;
 mod media_storage_service;
 mod models;
+mod plugin_discovery;
 mod plugin_service;
 mod processors;
 mod proxy_headers;
@@ -535,6 +536,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     quick_connect::QuickConnectStorage::start_cleanup_task(app_state.quick_connect.clone());
+
+    // Learn which plugin surfaces the pinned client actually serves, so a plugin the shipped
+    // policy has never heard of works without hand-editing that policy. Spawned rather than
+    // awaited: it reaches out over the network, and a pinned host that is not up yet must delay
+    // nothing. Such a pass simply finds nothing, and the Plugins page can run another.
+    tokio::task::spawn({
+        let state = app_state.clone();
+        async move {
+            plugin_discovery::discover_and_enable_assets(&state).await;
+        }
+    });
 
     let session_store = SqliteStore::new(pool.clone());
     session_store.migrate().await?;
