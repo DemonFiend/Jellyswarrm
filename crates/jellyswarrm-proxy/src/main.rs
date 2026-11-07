@@ -836,34 +836,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .merge(web_client_routes(any(
                 handlers::web_client::web_client_handler,
             )))
-            // Plugin asset and configuration surfaces, pinned to the same origin as the
-            // client that requests them. Section *data* is deliberately absent: those
-            // endpoints return media items and have to federate across servers.
-            .route(
-                "/PluginPages/{*path}",
-                any(handlers::web_client::plugin_asset_handler),
-            )
-            .route(
-                "/MediaBar/{*path}",
-                any(handlers::web_client::plugin_asset_handler),
-            )
-            // The tab list is a policy decision rather than an asset: it decides whose tabs a
-            // browser sees, so it is answered here instead of being relayed to one host.
+            // Plugin asset surfaces are not registered here. They are decided from
+            // `plugin_asset_prefixes` in the catch-all, so the configured list governs them and a
+            // new plugin surface needs no route and no rebuild; see
+            // `handlers::web_client::plugin_asset_host`.
+            //
+            // The tab list is the exception, because it is a policy decision rather than an asset:
+            // it decides whose tabs a browser sees, so it is answered here instead of being
+            // relayed to one host.
             .route(
                 "/CustomTabs/config",
                 any(handlers::custom_tabs::custom_tabs_config),
-            )
-            .route(
-                "/CustomTabs/{*path}",
-                any(handlers::web_client::plugin_asset_handler),
-            )
-            .route(
-                "/HomeScreen/home-screen-sections.js",
-                any(handlers::web_client::plugin_asset_handler),
-            )
-            .route(
-                "/HomeScreen/home-screen-sections.css",
-                any(handlers::web_client::plugin_asset_handler),
             )
             .route("/{*path}", any(proxy_handler))
             .fallback(proxy_handler)
@@ -1195,6 +1178,16 @@ async fn proxy_handler(
             if_none_match.as_deref(),
             content.data.into_owned(),
         );
+    }
+
+    // A plugin's assets must come from the origin that served the client that asked for them: a
+    // script injected by one server's plugin, answered by another server's copy of it, is how
+    // version skew becomes a silently broken page. Decided before any per-request server
+    // resolution can send them elsewhere, and after the embedded-asset lookup above so that a
+    // mistaken prefix can never shadow the bundled client.
+    let plugin_asset_host = handlers::web_client::plugin_asset_host(&state, req.uri().path()).await;
+    if let Some(host) = plugin_asset_host {
+        return handlers::web_client::relay_to_client_host(&state, &host, req).await;
     }
 
     let preprocessed = match preprocess_request(req, &state).await {

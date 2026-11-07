@@ -30,7 +30,7 @@ or a home row failing to render and nothing logged. Pinning makes that unreprese
 flowchart TD
     A[Browser] --> B{Path}
     B -->|"/web, /web/, /web/*"| C[web_client_handler]
-    B -->|plugin asset prefix| D[plugin_asset_handler]
+    B -->|plugin asset prefix| D[catch-all, relayed verbatim]
     B -->|plugin API prefix| E[catch-all, pinned by policy]
     B -->|federated plugin data| F[plugin_data: fan out to every server, merge]
     B -->|everything else| G[catch-all, normal federation]
@@ -75,11 +75,14 @@ wrong for anything that identifies the caller. An **API** prefix is pinned but g
 authorization remapping. Jellyfin Enhanced's endpoints identify the caller, which is why they are in
 the API list; pinning `/HomeScreen/Meta` as an asset is what failed.
 
-> [!IMPORTANT]
-> `plugin_asset_prefixes` is consulted *inside* a handler reached by hardcoded routes in `main.rs`.
-> Removing a prefix takes effect immediately, but **adding one does nothing without a matching
-> route**, which means a rebuild. The API lists have no such limitation — the catch-all consults
-> them on every request.
+All five lists are live policy: the catch-all consults them on every request, so adding a prefix
+pins a plugin surface immediately — no route to register, no rebuild, no restart. That is what makes
+the Plugins page able to enable a plugin the shipped defaults have never heard of.
+
+It was not always so. Asset prefixes were once reached only through a route registered per prefix,
+which made the list describe what it could not change: a prefix *added* to it had no route to reach
+the handler that read it, so only a removal ever took effect. If you are reading an older branch,
+that is the behaviour you have.
 
 ### Federated plugin data
 
@@ -125,12 +128,13 @@ done
 
 # 3. What is the proxy deciding? (needs RUST_LOG=jellyswarrm_proxy=debug)
 docker logs --since 3m jellyswarrm 2>&1 | grep -iE \
-  "Relaying|Federating plugin data|Refusing to pin|Failed to preprocess|abandoned|timed out"
+  "Relaying|Pinning plugin asset|Federating plugin data|Failed to preprocess|abandoned|timed out"
 ```
 
-`Refusing to pin` means a hardcoded route fired for a path the policy does not list — the request
-degrades to normal federation rather than failing. `Federating plugin data ... across N servers` is
-the fan-out working; `abandoned` or `timed out` means a leg exceeded `federated_leg_timeout`.
+`Pinning plugin asset ... to the web client host` confirms the policy matched and the request was
+relayed; its absence for a path you expected means that prefix is not in `plugin_asset_prefixes`,
+and the request went to ordinary federation instead. `Federating plugin data ... across N servers`
+is the fan-out working; `abandoned` or `timed out` means a leg exceeded `federated_leg_timeout`.
 
 Two traps that cost real time:
 

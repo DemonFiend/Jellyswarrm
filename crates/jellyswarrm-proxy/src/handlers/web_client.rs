@@ -45,15 +45,33 @@ pub fn matches_plugin_prefix(path: &str, prefixes: &[String]) -> bool {
         .any(|prefix| path.eq_ignore_ascii_case(prefix) || starts_with_segment(path, prefix))
 }
 
-/// The configured plugin asset prefixes.
-pub async fn plugin_asset_prefixes(state: &AppState) -> Vec<String> {
-    state
-        .config
-        .read()
-        .await
-        .plugin_federation
-        .plugin_asset_prefixes
-        .clone()
+/// The pinned client origin to relay `path` to, when `path` is a configured plugin asset surface.
+///
+/// The host and the policy come from a single config read, so a reload cannot be observed
+/// half-applied.
+///
+/// Consulted from the catch-all rather than from a route registered per prefix. Registering a route
+/// per prefix makes the policy a build-time constant: a prefix *added* to the list has no route to
+/// reach the handler that reads the list, so only a removal ever takes effect. Deciding it here is
+/// what makes the configured list actually govern the behaviour - which is what the Plugins page
+/// has always implied, and what lets a plugin surface be added without rebuilding the image.
+///
+/// Only asset and configuration surfaces belong in this list. An endpoint that returns media items
+/// is data, not chrome: pinning it would quietly make that surface single-server, which is the
+/// defect this whole module exists to remove.
+pub async fn plugin_asset_host(state: &AppState, path: &str) -> Option<String> {
+    let config = state.config.read().await;
+
+    let host = config.web_client_host.trim().trim_end_matches('/');
+    if host.is_empty() {
+        return None;
+    }
+    if !matches_plugin_prefix(path, &config.plugin_federation.plugin_asset_prefixes) {
+        return None;
+    }
+
+    debug!("Pinning plugin asset {path} to the web client host {host}");
+    Some(host.to_string())
 }
 
 /// Prefix match on a path-segment boundary, so `/MediaBarSomethingElse` does not match `/MediaBar`.
@@ -197,33 +215,6 @@ fn bundled_asset(path: &str) -> Option<Response<Body>> {
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(asset.data.into_owned()))
         .ok()
-}
-
-/// Plugin asset and configuration routes, pinned to the same host as the client.
-///
-/// These must come from the same origin as the application that requests them — a script tag
-/// injected by one server's plugin, answered by a different server's copy of that plugin, is how
-/// version skew turns into a silently broken page.
-pub async fn plugin_asset_handler(
-    State(state): State<AppState>,
-    req: Request,
-) -> Result<Response<Body>, StatusCode> {
-    let Some(host) = configured_host(&state).await else {
-        return crate::proxy_handler(State(state), req).await;
-    };
-
-    // Guard the pin rather than trusting route registration alone. Pinning a data endpoint here
-    // would silently make that surface single-server, which is precisely the defect being removed,
-    // and a route added to the wrong list is an easy mistake to make. Fall through to the ordinary
-    // request path rather than failing, so a misfiled route degrades to the unpinned behaviour.
-    let prefixes = plugin_asset_prefixes(&state).await;
-    let path = req.uri().path();
-    if !matches_plugin_prefix(path, &prefixes) {
-        error!("Refusing to pin {path} to the web client host: it is not a plugin asset route");
-        return crate::proxy_handler(State(state), req).await;
-    }
-
-    relay_to_client_host(&state, &host, req).await
 }
 
 /// Redirect target for `/` when a pinned client host is configured.
@@ -378,5 +369,228 @@ mod tests {
         ));
         assert!(matches_plugin_prefix("/jellyfinenhanced/plugin.js", &api));
         assert!(!matches_plugin_prefix("/JellyfinEnhancedExtra/thing", &api));
+    }
+}
+
+#[cfg(test)]
+mod plugin_asset_policy_tests {
+    use super::*;
+    use crate::config::{AppConfig, MIGRATOR};
+    use crate::handlers::quick_connect::QuickConnectStorage;
+    use crate::media_storage_service::MediaStorageService;
+    use crate::server_storage::ServerStorageService;
+    use crate::session_storage::SessionStorage;
+    use crate::user_authorization_service::UserAuthorizationService;
+    use crate::virtual_library_service::VirtualLibraryService;
+    use crate::{DataContext, ProxyProcessors};
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+
+    async fn test_state() -> AppState {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let server_storage = ServerStorageService::new(pool.clone());
+        let media_storage = MediaStorageService::new(pool.clone());
+
+        let data_context = DataContext {
+            user_authorization: Arc::new(UserAuthorizationService::new(pool.clone())),
+            server_storage: Arc::new(server_storage.clone()),
+            media_storage: Arc::new(media_storage.clone()),
+            virtual_library_service: Arc::new(VirtualLibraryService::new(
+                pool,
+                server_storage,
+                media_storage,
+            )),
+            play_sessions: Arc::new(SessionStorage::new()),
+            config: Arc::new(tokio::sync::RwLock::new(AppConfig::default())),
+        };
+        let processors = ProxyProcessors::new(data_context.clone());
+
+        AppState::new(
+            reqwest::Client::new(),
+            reqwest::Client::new(),
+            data_context,
+            processors,
+            QuickConnectStorage::new(),
+        )
+    }
+
+    async fn set_host(state: &AppState, host: &str) {
+        state.config.write().await.web_client_host = host.to_string();
+    }
+
+    async fn set_asset_prefixes(state: &AppState, prefixes: &[&str]) {
+        state
+            .config
+            .write()
+            .await
+            .plugin_federation
+            .plugin_asset_prefixes = prefixes.iter().map(|p| p.to_string()).collect();
+    }
+
+    /// The point of deciding this from the catch-all. While each prefix had its own route, a prefix
+    /// added to the list had no route to reach the handler that reads the list, so the setting
+    /// could only ever *remove* pinning - it described what it could not change. An operator
+    /// installing a plugin the shipped defaults have never heard of must be able to pin it from the
+    /// Plugins page, without a rebuild.
+    #[tokio::test]
+    async fn a_prefix_added_at_runtime_is_pinned_without_a_rebuild() {
+        let state = test_state().await;
+        set_host(&state, "https://client.example").await;
+
+        assert_eq!(
+            plugin_asset_host(&state, "/SomeNewPlugin/script.js").await,
+            None,
+            "not pinned while the policy does not mention it"
+        );
+
+        set_asset_prefixes(&state, &["/SomeNewPlugin"]).await;
+
+        assert_eq!(
+            plugin_asset_host(&state, "/SomeNewPlugin/script.js").await,
+            Some("https://client.example".to_string()),
+            "adding the prefix must take effect with no route and no restart"
+        );
+    }
+
+    /// And the converse, which already worked and must keep working.
+    #[tokio::test]
+    async fn a_removed_prefix_stops_being_pinned() {
+        let state = test_state().await;
+        set_host(&state, "https://client.example").await;
+
+        assert!(plugin_asset_host(&state, "/MediaBar/slideshowpure.js")
+            .await
+            .is_some());
+
+        set_asset_prefixes(&state, &["/PluginPages"]).await;
+
+        assert_eq!(
+            plugin_asset_host(&state, "/MediaBar/slideshowpure.js").await,
+            None
+        );
+    }
+
+    /// A deployment that pins no host must behave exactly as it did before any of this existed:
+    /// the catch-all handles everything and nothing is relayed anywhere.
+    #[tokio::test]
+    async fn nothing_is_pinned_without_a_configured_host() {
+        let state = test_state().await;
+
+        for path in [
+            "/MediaBar/slideshowpure.js",
+            "/PluginPages/inject.js",
+            "/CustomTabs/anything",
+        ] {
+            assert_eq!(
+                plugin_asset_host(&state, path).await,
+                None,
+                "{path} must not be pinned when no host is configured"
+            );
+        }
+    }
+
+    /// Whitespace and a trailing slash are what an operator actually types into the field.
+    #[tokio::test]
+    async fn the_configured_host_is_normalised() {
+        let state = test_state().await;
+        set_host(&state, "  https://client.example/  ").await;
+
+        assert_eq!(
+            plugin_asset_host(&state, "/MediaBar/slideshowpure.js").await,
+            Some("https://client.example".to_string())
+        );
+    }
+
+    /// The guard that matters most. These endpoints return media items and have to be merged
+    /// across servers; pinning one sends the whole surface to a single server, and the symptom is
+    /// a page that renders with part of the catalogue missing rather than an error.
+    #[tokio::test]
+    async fn section_data_is_never_pinned_by_the_shipped_policy() {
+        let state = test_state().await;
+        set_host(&state, "https://client.example").await;
+
+        for path in [
+            "/HomeScreen/Sections",
+            "/HomeScreen/Section/RecentlyAddedMovies",
+            "/HomeScreen/Meta",
+            "/HomeScreen/CachedImage/abc",
+            "/JellyfinEnhanced/tag-data/user",
+            "/Items",
+        ] {
+            assert_eq!(
+                plugin_asset_host(&state, path).await,
+                None,
+                "{path} returns data and must stay federated"
+            );
+        }
+    }
+
+    /// The tests above prove what the policy decides. This one proves the catch-all actually asks
+    /// it: without the call in `proxy_handler`, every assertion above still passes while nothing is
+    /// pinned at all, because the routes that used to reach the relay are gone.
+    #[tokio::test]
+    async fn the_catch_all_relays_a_pinned_asset_to_the_client_host() {
+        use axum::body::Body;
+        use axum::extract::State;
+        use axum::http::Request as AxumRequest;
+        use http_body_util::BodyExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let client_host = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/MediaBar/slideshowpure.js"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("/* from the pinned host */"))
+            .expect(1)
+            .mount(&client_host)
+            .await;
+
+        let state = test_state().await;
+        set_host(&state, &client_host.uri()).await;
+
+        let request = AxumRequest::builder()
+            .uri("/MediaBar/slideshowpure.js")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = crate::proxy_handler(State(state), request)
+            .await
+            .expect("the relay must answer");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            body.as_ref(),
+            b"/* from the pinned host */",
+            "the body must come from the pinned client host, not the proxy"
+        );
+
+        // `expect(1)` above is asserted on drop: the pinned host must have been asked exactly once.
+        drop(client_host);
+    }
+
+    /// The shipped surfaces must keep working with no configuration beyond the host, since that is
+    /// what every existing deployment has.
+    #[tokio::test]
+    async fn the_shipped_surfaces_are_pinned_out_of_the_box() {
+        let state = test_state().await;
+        set_host(&state, "https://client.example").await;
+
+        for path in [
+            "/MediaBar/slideshowpure.js",
+            "/MediaBar/slideshowpure.css",
+            "/MediaBar/WebConfig",
+            "/PluginPages/inject.js",
+            "/CustomTabs/Config",
+            "/HomeScreen/home-screen-sections.js",
+            "/HomeScreen/home-screen-sections.css",
+            "/mediabar/webconfig",
+        ] {
+            assert!(
+                plugin_asset_host(&state, path).await.is_some(),
+                "{path} is a shipped plugin asset surface"
+            );
+        }
     }
 }
