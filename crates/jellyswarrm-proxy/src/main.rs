@@ -1055,6 +1055,65 @@ fn client_request_error(error: &anyhow::Error) -> &'static str {
     }
 }
 
+/// `ETag` for an asset served from the client embedded in the proxy.
+///
+/// Derived from the embedded content hash, so it changes exactly when the bytes do.
+fn bundled_asset_etag(sha256: &[u8]) -> String {
+    format!("\"{}\"", hex::encode(sha256))
+}
+
+/// Whether an `If-None-Match` header value already covers `etag`.
+///
+/// Handles the comma-separated list and the `W/` weak prefix, because a browser that received a
+/// 304 once will keep sending whatever form it stored.
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    if_none_match.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate.trim_start_matches("W/") == etag
+    })
+}
+
+/// Builds the response for an asset served from the embedded client.
+///
+/// Always carries a validator and `Cache-Control: no-cache`. Previously this path sent neither,
+/// and that was not merely a missed optimisation: the embedded filenames are not
+/// content-addressed - jellyfin-web carries its build hash in the *query string*, so
+/// `/web/main.jellyfin.bundle.js` names different bytes in every build. With no validator and no
+/// `Cache-Control` at all, a browser is free to apply heuristic freshness and reuse what it has
+/// without ever asking again.
+///
+/// That made pinning [`crate::config::AppConfig::web_client_host`] look like it did nothing. The
+/// proxy relays the pinned host's client correctly, but a browser that had already loaded the
+/// embedded client on the same origin keeps running it from cache - so every plugin UI the pinned
+/// host injects is silently absent, and the only symptom is that the plugins "don't work". It
+/// survives a normal reload, and `curl` cannot reproduce it, because curl has no cache.
+///
+/// `no-cache` means revalidate, not "never store", so the ETag keeps the common case a cheap 304 -
+/// and the bytes never leave memory in any event.
+fn bundled_asset_response(
+    mime: &str,
+    etag: &str,
+    if_none_match: Option<&str>,
+    data: Vec<u8>,
+) -> Result<Response<Body>, StatusCode> {
+    let builder = Response::builder()
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "no-cache");
+
+    let built = if if_none_match.is_some_and(|value| etag_matches(value, etag)) {
+        builder.status(StatusCode::NOT_MODIFIED).body(Body::empty())
+    } else {
+        builder
+            .header(header::CONTENT_TYPE, mime)
+            .body(Body::from(data))
+    };
+
+    built.map_err(|e| {
+        error!("Failed to build static asset response: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
 /// Every route that serves the browser's client application from the pinned origin.
 ///
 /// Built here, parameterised over the handler, so that a test can assemble the same routes with a
@@ -1118,13 +1177,18 @@ async fn proxy_handler(
     let decoded_path = normalize_asset_lookup_path(&percent_decode_str(path).decode_utf8_lossy());
     if let Some(content) = Asset::get(&decoded_path) {
         let mime = mime_guess::from_path(&decoded_path).first_or_octet_stream();
-        return Response::builder()
-            .header("Content-Type", mime.as_ref())
-            .body(Body::from(content.data.into_owned()))
-            .map_err(|e| {
-                error!("Failed to build static asset response: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            });
+        let etag = bundled_asset_etag(&content.metadata.sha256_hash());
+        let if_none_match = req
+            .headers()
+            .get(header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        return bundled_asset_response(
+            mime.as_ref(),
+            &etag,
+            if_none_match.as_deref(),
+            content.data.into_owned(),
+        );
     }
 
     let preprocessed = match preprocess_request(req, &state).await {
@@ -1424,6 +1488,90 @@ mod web_client_route_tests {
             "if this starts returning \"pinned\", axum's matcher has changed and the explicit \
              /web/ route is no longer what keeps the client on one origin"
         );
+    }
+}
+
+#[cfg(test)]
+mod bundled_asset_cache_tests {
+    use super::{bundled_asset_etag, bundled_asset_response, etag_matches};
+    use axum::http::{header, StatusCode};
+
+    const ETAG: &str = "\"0f1e2d\"";
+
+    /// The regression this exists for. Serving the embedded client with no validator and no
+    /// `Cache-Control` lets a browser reuse it on heuristic freshness alone - so after an operator
+    /// pins `web_client_host`, the browser keeps running the embedded client it already had and
+    /// every plugin UI the pinned host injects stays invisible, through reloads, with nothing
+    /// logged and no way to reproduce it with curl.
+    #[test]
+    fn every_bundled_asset_response_carries_a_validator_and_must_revalidate() {
+        let response =
+            bundled_asset_response("text/html", ETAG, None, b"<!DOCTYPE html>".to_vec()).unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(header::ETAG).unwrap(), ETAG);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache",
+            "without this a browser may never revalidate, and a config change never takes effect"
+        );
+    }
+
+    /// Revalidation has to stay cheap, or `no-cache` would mean re-sending the whole client on
+    /// every page load for deployments that pin no host at all.
+    #[test]
+    fn a_matching_etag_revalidates_as_a_bodyless_304() {
+        let response =
+            bundled_asset_response("text/html", ETAG, Some(ETAG), b"ignored".to_vec()).unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(header::ETAG).unwrap(), ETAG);
+        assert!(
+            response.headers().get(header::CONTENT_TYPE).is_none(),
+            "a 304 carries no representation"
+        );
+    }
+
+    /// A stale validator must still produce the asset, or a changed build would never reach the
+    /// browser - the same failure in the opposite direction.
+    #[test]
+    fn a_stale_etag_still_gets_the_asset() {
+        let response = bundled_asset_response(
+            "text/html",
+            ETAG,
+            Some("\"a-previous-build\""),
+            b"<!DOCTYPE html>".to_vec(),
+        )
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A browser sends back whatever form it stored, and a reverse proxy in front of this may make
+    /// the validator weak, so neither form can be treated as a miss.
+    #[test]
+    fn etag_matching_handles_weak_validators_and_lists() {
+        assert!(etag_matches(ETAG, ETAG));
+        assert!(etag_matches("W/\"0f1e2d\"", ETAG), "weak validator");
+        assert!(
+            etag_matches("\"other\", \"0f1e2d\"", ETAG),
+            "comma-separated list"
+        );
+        assert!(etag_matches("*", ETAG), "wildcard");
+
+        assert!(!etag_matches("\"0f1e2e\"", ETAG), "a different hash");
+        assert!(!etag_matches("", ETAG), "no validator at all");
+    }
+
+    /// The validator has to follow the bytes, since the filename does not: jellyfin-web keeps its
+    /// build hash in the query string, so one path names different content in every build.
+    #[test]
+    fn the_etag_follows_the_content_hash() {
+        let one = bundled_asset_etag(&[0x0f, 0x1e, 0x2d]);
+        let other = bundled_asset_etag(&[0x0f, 0x1e, 0x2e]);
+
+        assert_eq!(one, ETAG, "quoted lowercase hex of the content hash");
+        assert_ne!(one, other, "different bytes must not share a validator");
     }
 }
 
