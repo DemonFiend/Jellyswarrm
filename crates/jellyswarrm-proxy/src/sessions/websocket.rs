@@ -15,6 +15,7 @@ use tokio::{
     sync::mpsc,
     time::{Duration, Instant, MissedTickBehavior},
 };
+use tracing::debug;
 
 pub async fn websocket(
     State(state): State<AppState>,
@@ -91,9 +92,27 @@ async fn handle(state: AppState, session: SessionContext, socket: WebSocket) {
                 }
                 if let Some((next, period)) = subscription {
                     if Instant::now() >= next {
+                        // A periodic status snapshot is never worth the
+                        // connection. Its outbound queue is shared with
+                        // SyncPlay's commands and holds OUTBOUND_CAPACITY, so a
+                        // burst of those fills it - and closing the socket here
+                        // costs the client its connection, which it rebuilds by
+                        // reconnecting, which makes the server resend the group
+                        // and its queue, which restarts the client's playback,
+                        // which produces another burst. That loop ran about
+                        // once a second and paused every other member of the
+                        // group along with it. Skip the tick instead.
                         match snapshots(&state, &session.user.id).await {
-                            Ok(sessions) => if transport.send(&session.session_id, "Sessions", &sessions).is_err() { break; },
-                            Err(_) => break,
+                            Ok(sessions) => {
+                                if let Err(status) =
+                                    transport.send(&session.session_id, "Sessions", &sessions)
+                                {
+                                    debug!(session_id = %session.session_id, %status, "Skipped a session snapshot push");
+                                }
+                            }
+                            Err(status) => {
+                                debug!(session_id = %session.session_id, %status, "Could not build a session snapshot");
+                            }
                         }
                         subscription = Some((Instant::now() + period, period));
                     }
