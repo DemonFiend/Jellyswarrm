@@ -15,7 +15,7 @@ use tokio::{
     sync::mpsc,
     time::{Duration, Instant, MissedTickBehavior},
 };
-use tracing::debug;
+use tracing::{debug, info};
 
 pub async fn websocket(
     State(state): State<AppState>,
@@ -55,39 +55,55 @@ async fn handle(state: AppState, session: SessionContext, socket: WebSocket) {
     let mut subscription: Option<(Instant, Duration)> = None;
     let mut auth_check = Instant::now();
     let mut last_inbound = Instant::now();
-    loop {
+    let opened_at = Instant::now();
+    let mut inbound_frames: u64 = 0;
+    let mut ever_subscribed = false;
+    // Every way out of this loop names itself, because a socket closing is not
+    // a local event: the client reconnects, the server resends the group and
+    // its play queue, and so anything that makes sockets churn is paid for by
+    // the whole SyncPlay group. There are ten exits here and, once the loop has
+    // ended, nothing to tell them apart - so each one says which it was, and
+    // the line below reports it with the shape of the connection that took it.
+    let reason = loop {
         tokio::select! {
             outbound = rx.recv() => {
-                let Some(text) = outbound else { break; };
-                if !transport.is_current(&session.session_id, generation) { break; }
-                if !tokio::time::timeout(Duration::from_secs(10), sender.send(Message::Text(text.into()))).await.is_ok_and(|r| r.is_ok()) { break; }
+                let Some(text) = outbound else { break "outbound queue closed"; };
+                if !transport.is_current(&session.session_id, generation) { break "replaced in the hub (outbound)"; }
+                if !tokio::time::timeout(Duration::from_secs(10), sender.send(Message::Text(text.into()))).await.is_ok_and(|r| r.is_ok()) { break "outbound write failed or timed out"; }
             }
             inbound = receiver.next() => {
-                let Some(Ok(inbound)) = inbound else { break; };
-                if !transport.is_current(&session.session_id, generation) { break; }
+                let Some(Ok(inbound)) = inbound else { break "inbound stream ended or errored"; };
+                if !transport.is_current(&session.session_id, generation) { break "replaced in the hub (inbound)"; }
+                inbound_frames += 1;
                 last_inbound = Instant::now();
                 state.client_sessions.touch(&session.session_id).await;
                 match inbound {
                     Message::Text(text) => if let Ok(message) = serde_json::from_str::<InboundMessage>(&text) {
                         match message.message_type.to_ascii_lowercase().as_str() {
                             "keepalive" => { let _ = transport.send(&session.session_id, "KeepAlive", &serde_json::Value::Null); }
-                            "sessionsstart" => if let Some((delay, period)) = subscription_interval(&message.data) { subscription = Some((Instant::now() + delay, period)); },
+                            "sessionsstart" => if let Some((delay, period)) = subscription_interval(&message.data) {
+                                ever_subscribed = true;
+                                subscription = Some((Instant::now() + delay, period));
+                            },
                             "sessionsstop" => subscription = None,
                             _ => {}
                         }
                     },
                     Message::Ping(payload) => {
-                        if !tokio::time::timeout(Duration::from_secs(10), sender.send(Message::Pong(payload))).await.is_ok_and(|r| r.is_ok()) { break; }
+                        if !tokio::time::timeout(Duration::from_secs(10), sender.send(Message::Pong(payload))).await.is_ok_and(|r| r.is_ok()) { break "pong write failed or timed out"; }
                     }
-                    Message::Close(_) => break,
+                    Message::Close(_) => break "client sent a close frame",
                     _ => {}
                 }
             }
             _ = interval.tick() => {
-                if !transport.is_current(&session.session_id, generation) || last_inbound.elapsed() > Duration::from_secs(60) { break; }
+                // Split for the log's sake: being replaced and going quiet are
+                // the same shutdown but very different diagnoses.
+                if !transport.is_current(&session.session_id, generation) { break "replaced in the hub (tick)"; }
+                if last_inbound.elapsed() > Duration::from_secs(60) { break "no inbound frame for 60s"; }
                 if auth_check.elapsed() >= Duration::from_secs(15) {
-                    let Some(current) = state.client_sessions.get(&session.session_id).await else { break; };
-                    if !matches!(valid_session(&state, &current).await, Ok(true)) { break; }
+                    let Some(current) = state.client_sessions.get(&session.session_id).await else { break "session gone from the store"; };
+                    if !matches!(valid_session(&state, &current).await, Ok(true)) { break "session no longer authorised"; }
                     auth_check = Instant::now();
                 }
                 if let Some((next, period)) = subscription {
@@ -119,7 +135,16 @@ async fn handle(state: AppState, session: SessionContext, socket: WebSocket) {
                 }
             }
         }
-    }
+    };
+    info!(
+        session_id = %session.session_id,
+        %generation,
+        reason,
+        lifetime_ms = opened_at.elapsed().as_millis(),
+        inbound_frames,
+        ever_subscribed,
+        "Client websocket closed"
+    );
     state
         .syncplay
         .unregister_websocket_with_grace(session.session_id, generation)
