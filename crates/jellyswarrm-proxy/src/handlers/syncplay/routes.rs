@@ -18,30 +18,73 @@ use crate::AppState;
 use super::models::*;
 use super::service::SessionContext;
 
+/// Tell a client that reported against the wrong item which item the group is
+/// actually on, and say whether its report was answered that way.
+///
+/// A client reports readiness carrying the item it was playing, so a mismatch
+/// is routine mid-transition and is **not** by itself proof that the client is
+/// lost. Re-sending the queue on every report is therefore a trap: the client
+/// treats a `PlayQueue` update as "load this and play", so it tears playback
+/// down, starts over, reports the same stale id, and gets corrected again -
+/// about once a second, forever. Worse, answering the report this way discards
+/// it, so that member never becomes ready and the whole group stays in
+/// `Waiting` behind it.
+///
+/// So correct a given mismatch once. If the client reports the same stale id
+/// again, the correction plainly did not help, and recording its readiness is
+/// far better than restarting it a second time.
 fn try_send_playlist_correction(
-    group: &SyncPlayGroup,
+    group: &mut SyncPlayGroup,
     sync_state: &mut super::service::SyncPlayState,
     expected_playlist_item_id: Option<Uuid>,
     session_id: &str,
 ) -> bool {
-    let Some(expected_playlist_item_id) = expected_playlist_item_id else {
+    let Some(expected) = expected_playlist_item_id else {
         return false;
     };
 
-    if let Some(current) = group
+    let Some(current) = group
         .playing_item_index
         .and_then(|idx| group.playlist.get(idx))
-    {
-        if current.playlist_item_id != expected_playlist_item_id {
-            sync_state.send_queue_update_to(
-                group,
-                PlayQueueUpdateReason::SetCurrentItem,
-                vec![session_id.to_string()],
-            );
-            return true;
-        }
+        .map(|item| item.playlist_item_id)
+    else {
+        return false;
+    };
+    if current == expected {
+        return false;
     }
-    false
+
+    if group
+        .participants
+        .get(session_id)
+        .is_some_and(|member| member.last_correction_for == Some(expected))
+    {
+        debug!(
+            group_id = %group.group_id,
+            session_id = %session_id,
+            %expected,
+            %current,
+            "SyncPlay client still reports a stale item after a correction; taking the report anyway"
+        );
+        return false;
+    }
+
+    if let Some(member) = group.participants.get_mut(session_id) {
+        member.last_correction_for = Some(expected);
+    }
+    debug!(
+        group_id = %group.group_id,
+        session_id = %session_id,
+        %expected,
+        %current,
+        "Correcting a SyncPlay client's current item"
+    );
+    sync_state.send_queue_update_to(
+        group,
+        PlayQueueUpdateReason::SetCurrentItem,
+        vec![session_id.to_string()],
+    );
+    true
 }
 
 fn sanitize_client_when(when: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
@@ -923,4 +966,133 @@ pub async fn get_utc_time(
         request_reception_time,
         response_transmission_time,
     }))
+}
+
+#[cfg(test)]
+mod playlist_correction_tests {
+    use super::*;
+    use crate::encryption::HashedPassword;
+    use crate::handlers::syncplay::service::SyncPlayService;
+    use crate::user_authorization_service::{LocalCredential, User};
+    use tokio::sync::mpsc;
+
+    fn session(id: &str) -> SessionContext {
+        SessionContext {
+            session_id: format!("{id}:web"),
+            user: User {
+                id: id.into(),
+                virtual_key: format!("vk-{id}"),
+                original_username: id.to_string(),
+                local_credential: LocalCredential::Password(HashedPassword::from_hashed(
+                    "0".repeat(64),
+                )),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        }
+    }
+
+    /// Run one readiness report carrying `reported`, and say whether the proxy
+    /// answered it with a queue correction instead of recording it.
+    async fn correction_sent(
+        service: &SyncPlayService,
+        caller: &SessionContext,
+        reported: Uuid,
+    ) -> bool {
+        let out = std::cell::Cell::new(false);
+        let _ = service
+            .with_group_for_session(caller, |group, sync_state| {
+                out.set(try_send_playlist_correction(
+                    group,
+                    sync_state,
+                    Some(reported),
+                    &caller.session_id,
+                ));
+            })
+            .await;
+        out.get()
+    }
+
+    #[tokio::test]
+    async fn a_stale_client_is_corrected_once_not_on_every_report() {
+        let service = SyncPlayService::new();
+        let caller = session("u1");
+        let (tx, _rx) = mpsc::channel::<String>(64);
+        service
+            .register_websocket(caller.session_id.clone(), tx)
+            .await;
+        service
+            .create_group(&caller, "party".to_string())
+            .await
+            .expect("group creation should succeed");
+
+        let _ = service
+            .with_group_for_session(&caller, |group, _| {
+                group.playlist = vec![SyncPlayQueueItem {
+                    item_id: "virtual-media-a".to_string(),
+                    playlist_item_id: Uuid::new_v4(),
+                }];
+                group.playing_item_index = Some(0);
+            })
+            .await;
+
+        // The client keeps reporting the item it was playing a moment ago,
+        // which is what a client does while it is being restarted.
+        let stale = Uuid::new_v4();
+        let answers = [
+            correction_sent(&service, &caller, stale).await,
+            correction_sent(&service, &caller, stale).await,
+            correction_sent(&service, &caller, stale).await,
+            correction_sent(&service, &caller, stale).await,
+        ];
+
+        assert_eq!(
+            answers,
+            [true, false, false, false],
+            "a stale client must be corrected once and then have its reports \
+             recorded; correcting every report restarts its playback about once \
+             a second forever and never lets the group leave Waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_mismatch_is_still_corrected_after_the_queue_moves_on() {
+        let service = SyncPlayService::new();
+        let caller = session("u1");
+        let (tx, _rx) = mpsc::channel::<String>(64);
+        service
+            .register_websocket(caller.session_id.clone(), tx)
+            .await;
+        service
+            .create_group(&caller, "party".to_string())
+            .await
+            .expect("group creation should succeed");
+
+        let _ = service
+            .with_group_for_session(&caller, |group, _| {
+                group.playlist = vec![SyncPlayQueueItem {
+                    item_id: "virtual-media-a".to_string(),
+                    playlist_item_id: Uuid::new_v4(),
+                }];
+                group.playing_item_index = Some(0);
+            })
+            .await;
+
+        let stale = Uuid::new_v4();
+        assert!(correction_sent(&service, &caller, stale).await);
+        assert!(!correction_sent(&service, &caller, stale).await);
+
+        // The group moves to a new item, so the client is owed a fresh
+        // correction rather than being written off by the earlier one.
+        let _ = service
+            .with_group_for_session(&caller, |group, _| {
+                group.transition_to_waiting(true);
+            })
+            .await;
+
+        assert!(
+            correction_sent(&service, &caller, stale).await,
+            "a correction must be allowed again once the group's item changes"
+        );
+    }
 }

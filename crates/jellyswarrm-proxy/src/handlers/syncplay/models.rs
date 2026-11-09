@@ -217,6 +217,9 @@ pub(super) struct GroupParticipant {
     pub ignore_wait: bool,
     pub is_connected: bool,
     pub last_client_when: Option<DateTime<Utc>>,
+    /// The item id this member was last told to correct to, so the same
+    /// correction is never sent twice. See `try_send_playlist_correction`.
+    pub last_correction_for: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -317,6 +320,8 @@ impl SyncPlayGroup {
         self.waiting_resume_playing = resume_playing;
         for member in self.participants.values_mut() {
             member.is_buffering = true;
+            // The current item may have changed, so allow one correction again.
+            member.last_correction_for = None;
         }
     }
 

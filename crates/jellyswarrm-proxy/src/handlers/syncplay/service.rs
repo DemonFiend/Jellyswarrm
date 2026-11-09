@@ -433,6 +433,7 @@ impl SyncPlayService {
             ignore_wait: false,
             is_connected: true,
             last_client_when: None,
+            last_correction_for: None,
         }
     }
 
