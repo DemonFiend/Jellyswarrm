@@ -1,6 +1,6 @@
 # Porting This Fork to a New Upstream Release
 
-This fork carries 29 commits on top of upstream `main`. This document is how to move them onto a
+This fork carries 34 commits on top of upstream `main`. This document is how to move them onto a
 new upstream release without re-introducing work upstream has since done itself.
 
 ## Strategy: fresh branch, replay selectively
@@ -105,7 +105,7 @@ deciding the foundation still applies.
 catch-all, a discovered prefix had no route to reach the handler that reads the policy, so nothing
 discovered at runtime could be served. Port it first or the rest does nothing.
 
-**Engine fixes upstream does not have.** These are not plugin work and each one is a silent
+**Engine fixes upstream does not have.** These are not plugin work, and all but one are a silent
 correctness bug — check whether upstream fixed them, but do not drop them without checking.
 
 | | |
@@ -115,12 +115,27 @@ correctness bug — check whether upstream fixed them, but do not drop them with
 | `e230adf` | Distinguish an unprobed server from a confirmed-offline one |
 | `a6f600a` | Report unusable credentials as 401 rather than 400 |
 | `f152be6` | Stop a member who has gone from holding SyncPlay open |
+| `50c7d55` | Correct a SyncPlay client's item once, not on every report |
+| `c35b6c1` | Never close a client's socket over a dropped status snapshot |
+| `a3a92bc` | Let a reconnecting client recognise the queue it already has |
+| `fda9f5e` | Name every exit from the client websocket loop |
 
-`54df2c3` is this document and `docs/plugin-federation.md`, and `cb9be63` is a later revision
-of it; neither carries code.
+`54df2c3` is this document and `docs/plugin-federation.md`, `cb9be63` is a later revision
+of it, and `9767900` is this inventory plus the SyncPlay README's liveness invariant; none
+carries code.
+
+The last four SyncPlay entries are one story and port best together. A client whose socket
+churns makes the server resend the group and its play queue; the client reads the resend as a
+new playlist and restarts playback; each restart reports readiness to every member. So a
+single unstable client paused everyone. `a3a92bc` is the load-bearing one - it stops a
+reconnect from costing the group anything, whatever caused it - and `fda9f5e` is what makes
+the cause answerable at all. Taking `a3a92bc` without `fda9f5e` leaves you with the same
+blind spot this fork spent two deploys inside.
 
 Each commit message states the mechanism and the symptom; read it before deciding the commit is
-cosmetic. Three of the four engine fixes produce no error of any kind when they regress.
+cosmetic. Eight of the nine are correctness fixes and `fda9f5e` is the diagnostics that made the last
+three of them findable. Seven of those eight produce no error of any kind when they regress;
+only `a6f600a` announces itself.
 
 ## Hazards
 
