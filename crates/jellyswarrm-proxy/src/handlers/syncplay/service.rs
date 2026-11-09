@@ -333,20 +333,30 @@ impl SyncPlayService {
 
         if let Some(group_id) = state.session_to_group.get(&session_id).copied() {
             if let Some(mut group) = state.groups.remove(&group_id) {
+                // Reconnecting is not an event in the group's life, only in one
+                // member's connection, so leave the group exactly as it was.
+                //
+                // In particular do not `touch()` it. The client ignores a play
+                // queue whose `LastUpdate` is not newer than the one it already
+                // holds, which is precisely how a redundant resync is meant to
+                // be absorbed - and bumping the timestamp first defeats that,
+                // so the client reads the snapshot as a new playlist and
+                // restarts playback. With a socket that reconnects often, that
+                // restarts playback just as often, and every restart's
+                // readiness report is broadcast to the whole group.
+                //
+                // That same check sorts the two kinds of reconnect without the
+                // server having to tell them apart: a client that reloaded has
+                // no stored timestamp and applies the queue, while one that
+                // only lost its socket has an equal or newer one and ignores
+                // it. So neither is the member marked buffering nor the group
+                // put into `Waiting` here - a client that really did reload
+                // reports its own buffering as it loads, which takes the group
+                // through `Waiting` by the ordinary path.
                 if let Some(member) = group.participants.get_mut(&session_id) {
                     member.is_connected = true;
-                    member.is_buffering = !group.playlist.is_empty();
                     member.last_client_when = None;
                 }
-                if !group.playlist.is_empty() {
-                    let now = Utc::now();
-                    let resume_playing = group.is_playing;
-                    let position_ticks = group.freeze_at_estimated_position(now);
-                    group.pending_position_ticks = Some(position_ticks);
-                    group.state = GroupStateType::Waiting;
-                    group.waiting_resume_playing = resume_playing;
-                }
-                group.touch();
                 state.send_group_update(
                     vec![session_id.clone()],
                     group_id,
@@ -358,17 +368,16 @@ impl SyncPlayService {
                     PlayQueueUpdateReason::NewPlaylist,
                     vec![session_id.clone()],
                 );
-                if group.state == GroupStateType::Waiting {
-                    if group.waiting_resume_playing {
-                        state.broadcast_command(
-                            &group,
-                            SendCommandType::Pause,
-                            Some(group.start_position_ticks),
-                            0,
-                        );
-                    }
-                    state.broadcast_state_update(&group, "Buffer");
-                }
+                state.send_group_update(
+                    vec![session_id.clone()],
+                    group_id,
+                    GroupUpdateType::StateUpdate,
+                    serde_json::to_value(super::models::GroupStateUpdate {
+                        state: group.state.clone(),
+                        reason: "Reconnect",
+                    })
+                    .unwrap_or(Value::Null),
+                );
                 state.groups.insert(group_id, group);
             }
         }
@@ -1519,6 +1528,84 @@ mod tests {
                 .await
                 .is_none(),
             "the group itself should be gone, not just hidden"
+        );
+    }
+
+    /// Reconnecting must leave the group's `last_updated_at` alone, because
+    /// that timestamp is how the client recognises a play queue it already
+    /// holds and declines to act on it. Bump it and every reconnect reads as a
+    /// new playlist, so the client restarts playback - and with a socket that
+    /// reconnects often it restarts that often, broadcasting a readiness report
+    /// to the whole group each time.
+    #[tokio::test]
+    async fn test_reconnect_does_not_restamp_the_queue() {
+        let service = SyncPlayService::new();
+        let s1 = make_session(make_user("u1", "alice"), "web");
+
+        let (tx1, mut rx1) = mpsc::channel::<String>(64);
+        service.register_websocket(s1.session_id.clone(), tx1).await;
+        let group = service
+            .create_group(&s1, "party".to_string())
+            .await
+            .expect("group creation should succeed");
+
+        let settled = DateTime::parse_from_rfc3339("2026-11-09T12:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
+        let _ = service
+            .with_group_for_session(&s1, |g, _| {
+                g.playlist = vec![SyncPlayQueueItem {
+                    item_id: "virtual-media-a".to_string(),
+                    playlist_item_id: Uuid::new_v4(),
+                }];
+                g.playing_item_index = Some(0);
+                g.state = GroupStateType::Playing;
+                g.is_playing = true;
+                g.pending_position_ticks = None;
+                for member in g.participants.values_mut() {
+                    member.is_buffering = false;
+                }
+                g.last_updated_at = settled;
+            })
+            .await;
+        let _ = recv_many(&mut rx1, 16).await;
+
+        // The socket comes back. Nothing about the group has changed.
+        let (tx2, mut rx2) = mpsc::channel::<String>(64);
+        service.register_websocket(s1.session_id.clone(), tx2).await;
+
+        let snapshot = service
+            .get_group_snapshot_by_id(group.group_id)
+            .await
+            .expect("group missing");
+        assert_eq!(
+            snapshot.last_updated_at, settled,
+            "a reconnect must not restamp the queue"
+        );
+        assert_eq!(
+            snapshot.state,
+            GroupStateType::Playing,
+            "a reconnect must not put a playing group back into Waiting"
+        );
+        assert!(
+            !snapshot.participants[&s1.session_id].is_buffering,
+            "a reconnect must not mark a playing member as buffering"
+        );
+
+        let msgs = recv_many(&mut rx2, 16).await;
+        let queue = msgs
+            .iter()
+            .find(|m| m["Data"]["Data"]["Playlist"].is_array())
+            .expect("expected a play queue snapshot on reconnect");
+        let last_update = queue["Data"]["Data"]["LastUpdate"]
+            .as_str()
+            .expect("LastUpdate missing");
+        let last_update = DateTime::parse_from_rfc3339(last_update)
+            .expect("invalid LastUpdate")
+            .with_timezone(&Utc);
+        assert_eq!(
+            last_update, settled,
+            "the resent queue must carry its original timestamp so the client can ignore it"
         );
     }
 }
