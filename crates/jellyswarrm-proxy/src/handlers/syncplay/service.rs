@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::sessions::transport::ConnectionHub;
@@ -33,13 +33,27 @@ pub(super) struct SyncPlayState {
 
 impl SyncPlayState {
     /// Send a raw websocket message to a single session.
+    ///
+    /// Delivery is best effort: `ConnectionHub` drops a message when the
+    /// member's outbound queue is full, and reports a connection that has
+    /// already gone. SyncPlay's state machine assumes a command arrived, so a
+    /// silent drop leaves the group believing a member is in step when it
+    /// never heard the command - and the member sits paused while everyone
+    /// else plays. Nothing can re-deliver it from here, so at least say so.
     fn send_to_session<T: Serialize>(
         &mut self,
         session_id: &str,
         msg_type: &'static str,
         data: &T,
     ) {
-        let _ = self.transport.send(session_id, msg_type, data);
+        if let Err(status) = self.transport.send(session_id, msg_type, data) {
+            warn!(
+                session_id = %session_id,
+                message_type = msg_type,
+                %status,
+                "Dropped a SyncPlay message; this member is no longer in step with the group"
+            );
+        }
     }
 
     /// Send a group-update envelope to specific sessions.
@@ -172,10 +186,29 @@ impl SyncPlayState {
         );
     }
 
+    /// Whether every member the group is still waiting on has reported ready.
+    ///
+    /// `GroupParticipant::is_connected` is a cached flag, and the only thing
+    /// that clears it is `unregister_websocket_with_grace` - which returns
+    /// early when the closing connection's generation no longer matches the
+    /// one the hub holds. So the flag can say "connected" for a member whose
+    /// socket is gone, and because such a member is also left mid-buffer, it
+    /// blocks the group forever: `Waiting` never resolves, every other member
+    /// buffers indefinitely, and the group never empties out of
+    /// `/SyncPlay/List`. The hub is the truth about liveness, so ask it too.
+    fn all_ready(&self, group: &SyncPlayGroup) -> bool {
+        group.participants.iter().all(|(session_id, member)| {
+            !member.is_connected
+                || !self.transport.is_connected(session_id)
+                || !member.is_buffering
+                || member.ignore_wait
+        })
+    }
+
     /// Resolve the Waiting state: if all participants are ready, transition to
     /// Playing (with delayed unpause) or Paused.
     pub(super) fn resolve_waiting(&mut self, group: &mut SyncPlayGroup, reason: &'static str) {
-        if group.state != GroupStateType::Waiting || !group.all_ready() {
+        if group.state != GroupStateType::Waiting || !self.all_ready(group) {
             return;
         }
         let now = Utc::now();
@@ -200,19 +233,45 @@ impl SyncPlayState {
         self.broadcast_command(group, cmd, Some(group.start_position_ticks), delay_ms);
         self.broadcast_state_update(group, reason);
     }
+
+    /// Drop members whose connection was lost without the socket task ever
+    /// running its cleanup.
+    ///
+    /// `unregister_websocket_with_grace` is the last statement of that task,
+    /// so a task that is cancelled rather than finished - a reverse proxy
+    /// dropping an idle upgrade, a client killed outright - never reaches it.
+    /// The cached `is_connected` flag then stays `true`, no grace timer is ever
+    /// scheduled, and nothing else will ever remove that member: the group
+    /// waits on it forever and lingers in `/SyncPlay/List` with a participant
+    /// who is not there.
+    ///
+    /// A graceful disconnect is a different state, because cleanup clears the
+    /// flag before the grace timer starts. Those members still have a
+    /// reconnect window owed to them, so they are deliberately left alone.
+    fn reap_lost_participants(&mut self) {
+        let lost: Vec<String> = self
+            .groups
+            .values()
+            .flat_map(|group| group.participants.iter())
+            .filter(|(session_id, member)| {
+                member.is_connected && !self.transport.is_connected(session_id)
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+
+        for session_id in lost {
+            warn!(
+                session_id = %session_id,
+                "Removing a SyncPlay member whose connection was lost without cleanup"
+            );
+            SyncPlayService::leave_locked(self, &session_id);
+        }
+    }
 }
 
 #[derive(Clone, Default)]
 pub struct SyncPlayService {
     state: Arc<RwLock<SyncPlayState>>,
-}
-
-impl SyncPlayGroup {
-    fn all_ready(&self) -> bool {
-        self.participants
-            .values()
-            .all(|p| !p.is_connected || !p.is_buffering || p.ignore_wait)
-    }
 }
 
 impl SyncPlayService {
@@ -571,8 +630,12 @@ impl SyncPlayService {
         Self::leave_locked(&mut state, &session.session_id);
     }
 
+    /// Snapshot every group, having first dropped members who are not really
+    /// there. A ghost member keeps its group alive and listed, so the listing
+    /// is the right place to settle up.
     pub(super) async fn list_group_snapshots(&self) -> Vec<SyncPlayGroup> {
-        let state = self.state.read().await;
+        let mut state = self.state.write().await;
+        state.reap_lost_participants();
         state.groups.values().cloned().collect()
     }
 
@@ -1325,5 +1388,136 @@ mod tests {
             .await
             .expect("group missing");
         assert_eq!(snapshot.participants.len(), 1);
+    }
+
+    /// A socket task that is cancelled rather than closed never reaches
+    /// `unregister_websocket_with_grace`, so the hub's sender dies while the
+    /// member's cached `is_connected` flag still says `true`. Reproduce that
+    /// exact state by dropping the receiver and leaving the hub entry behind.
+    fn lose_socket_without_cleanup(rx: mpsc::Receiver<String>) {
+        drop(rx);
+    }
+
+    async fn group_of_two_mid_buffer(
+        service: &SyncPlayService,
+        s1: &SessionContext,
+        s2: &SessionContext,
+    ) -> Uuid {
+        let group = service
+            .create_group(s1, "party".to_string())
+            .await
+            .expect("group creation should succeed");
+        service.join_group(s2, group.group_id, None).await;
+        let _ = service
+            .with_group_for_session(s1, |g, _| {
+                g.playlist = vec![SyncPlayQueueItem {
+                    item_id: "virtual-media-a".to_string(),
+                    playlist_item_id: Uuid::new_v4(),
+                }];
+                g.playing_item_index = Some(0);
+                g.state = GroupStateType::Waiting;
+                g.waiting_resume_playing = true;
+                for p in g.participants.values_mut() {
+                    p.is_buffering = true;
+                }
+            })
+            .await;
+        group.group_id
+    }
+
+    #[tokio::test]
+    async fn test_lost_socket_does_not_hold_the_group_in_waiting() {
+        let hub = ConnectionHub::default();
+        let service = SyncPlayService::with_transport(hub.clone());
+        let s1 = make_session(make_user("u1", "alice"), "web");
+        let s2 = make_session(make_user("u2", "bob"), "tv");
+
+        let (tx1, mut rx1) = mpsc::channel::<String>(64);
+        let (tx2, rx2) = mpsc::channel::<String>(64);
+        service.register_websocket(s1.session_id.clone(), tx1).await;
+        service.register_websocket(s2.session_id.clone(), tx2).await;
+
+        let group_id = group_of_two_mid_buffer(&service, &s1, &s2).await;
+        let _ = recv_many(&mut rx1, 16).await;
+
+        lose_socket_without_cleanup(rx2);
+        assert!(
+            !hub.is_connected(&s2.session_id),
+            "the hub should see the dead sender"
+        );
+        let snapshot = service
+            .get_group_snapshot_by_id(group_id)
+            .await
+            .expect("group missing");
+        assert!(
+            snapshot.participants[&s2.session_id].is_connected,
+            "the cached flag is what goes stale; without it there is nothing to fix"
+        );
+
+        // alice reports ready. She is the only member who can still answer,
+        // so the group has to proceed on her word alone.
+        let _ = service
+            .with_group_for_session(&s1, |g, sync_state| {
+                g.participants
+                    .get_mut(&s1.session_id)
+                    .expect("member missing")
+                    .is_buffering = false;
+                sync_state.resolve_waiting(g, "Ready");
+            })
+            .await;
+
+        let snapshot = service
+            .get_group_snapshot_by_id(group_id)
+            .await
+            .expect("group missing");
+        assert_eq!(
+            snapshot.state,
+            GroupStateType::Playing,
+            "a member who cannot answer must not hold the group in Waiting"
+        );
+        let msgs = recv_many(&mut rx1, 8).await;
+        assert!(
+            msgs.iter().any(|m| m["MessageType"] == "SyncPlayCommand"
+                && m["Data"]["Command"] == "Unpause"),
+            "expected alice to be unpaused, got {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lost_member_is_dropped_from_the_group_listing() {
+        let hub = ConnectionHub::default();
+        let service = SyncPlayService::with_transport(hub.clone());
+        let s1 = make_session(make_user("u1", "alice"), "web");
+
+        let (tx1, rx1) = mpsc::channel::<String>(64);
+        service.register_websocket(s1.session_id.clone(), tx1).await;
+
+        let group = service
+            .create_group(&s1, "party".to_string())
+            .await
+            .expect("group creation should succeed");
+        assert_eq!(
+            service.list_group_snapshots().await.len(),
+            1,
+            "the group should be listed while alice is really there"
+        );
+
+        lose_socket_without_cleanup(rx1);
+
+        assert!(
+            service.list_group_snapshots().await.is_empty(),
+            "a group whose only member is gone must not stay listed"
+        );
+        assert!(
+            !service.is_group_member(&s1.session_id).await,
+            "the membership should be released along with the group"
+        );
+        assert!(
+            service
+                .get_group_snapshot_by_id(group.group_id)
+                .await
+                .is_none(),
+            "the group itself should be gone, not just hidden"
+        );
     }
 }
