@@ -1,6 +1,6 @@
 # Porting This Fork to a New Upstream Release
 
-This fork carries 27 commits on top of upstream `main`. This document is how to move them onto a
+This fork carries 29 commits on top of upstream `main`. This document is how to move them onto a
 new upstream release without re-introducing work upstream has since done itself.
 
 ## Strategy: fresh branch, replay selectively
@@ -114,8 +114,10 @@ correctness bug — check whether upstream fixed them, but do not drop them with
 | `240619e` | Serve the session whose device id the client actually uses |
 | `e230adf` | Distinguish an unprobed server from a confirmed-offline one |
 | `a6f600a` | Report unusable credentials as 401 rather than 400 |
+| `f152be6` | Stop a member who has gone from holding SyncPlay open |
 
-`54df2c3` is this document and `docs/plugin-federation.md`; it carries no code.
+`54df2c3` is this document and `docs/plugin-federation.md`, and `cb9be63` is a later revision
+of it; neither carries code.
 
 Each commit message states the mechanism and the symptom; read it before deciding the commit is
 cosmetic. Three of the four engine fixes produce no error of any kind when they regress.
