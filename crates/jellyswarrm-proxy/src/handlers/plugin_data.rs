@@ -86,7 +86,7 @@ pub async fn merged_plugin_data(
 /// to five figures: the duplicate answers cost a multiple of the work to fetch, parse and merge for
 /// a result identical to asking once. Sessions arrive in server priority order, so keeping the first
 /// of each preserves the ordering the merge depends on to resolve scalar conflicts.
-fn one_session_per_server(
+pub(crate) fn one_session_per_server(
     sessions: &[(AuthorizationSession, Server)],
 ) -> Vec<(AuthorizationSession, Server)> {
     let mut seen = HashSet::new();

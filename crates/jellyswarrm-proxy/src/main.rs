@@ -856,10 +856,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The tab list is the exception, because it is a policy decision rather than an asset:
             // it decides whose tabs a browser sees, so it is answered here instead of being
             // relayed to one host.
-            .route(
-                "/CustomTabs/config",
-                any(handlers::custom_tabs::custom_tabs_config),
-            )
+            // Registered from the handler's own list, so the spelling the plugin asks for
+            // cannot drift away from the one that is routed. Axum matches byte for byte; the
+            // plugin's ASP.NET controller does not.
+            .merge(custom_tabs_routes())
             .route("/{*path}", any(proxy_handler))
             .fallback(proxy_handler)
             .layer(
@@ -1143,6 +1143,18 @@ where
         .route("/web", handler.clone())
         .route("/web/", handler.clone())
         .route("/web/{*path}", handler)
+}
+
+/// Registers the tab list at every spelling in [`handlers::custom_tabs::CONFIG_PATHS`], driven by
+/// that list so the path the plugin asks for cannot drift away from the path that is routed. The
+/// plugin's ASP.NET controller matches case-insensitively and axum matches byte for byte, which is
+/// how this handler came to be registered at a path nothing ever requested.
+fn custom_tabs_routes() -> Router<AppState> {
+    let mut router: Router<AppState> = Router::new();
+    for path in handlers::custom_tabs::CONFIG_PATHS {
+        router = router.route(path, any(handlers::custom_tabs::custom_tabs_config));
+    }
+    router
 }
 
 #[axum::debug_handler]
