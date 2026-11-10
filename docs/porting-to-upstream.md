@@ -1,6 +1,6 @@
 # Porting This Fork to a New Upstream Release
 
-This fork carries 34 commits on top of upstream `main`. This document is how to move them onto a
+This fork carries 35 commits on top of upstream `main`. This document is how to move them onto a
 new upstream release without re-introducing work upstream has since done itself.
 
 ## Strategy: fresh branch, replay selectively
@@ -88,6 +88,7 @@ Grouped by what each group is for, so a group can be evaluated as a unit.
 | `67c43e2` | Merge Home Screen Sections data across servers |
 | `c492f83` | Give each federated fan-out leg its own timeout |
 | `0c2a2f7` | Let an operator choose whose custom tabs a browser sees |
+| `58ee3d7` | Answer the tab list at the path the plugin actually asks for |
 | `a005e20` | Add a Plugins page for managing plugins across servers |
 | `3a0cd51` | Make the plugin federation policy editable from the Plugins page |
 
@@ -100,6 +101,10 @@ deciding the foundation still applies.
 | `9ee38d1` | Discover plugin surfaces from the client the pinned host serves |
 | `2ef0811` | Show what the pinned client serves, and ask about the rest |
 | `81b1afb` | Let one plugin surface be answered by one named server |
+
+`58ee3d7` is not optional alongside `0c2a2f7`: without it the handler that reads the mode is
+registered at a path the plugin never requests, so the setting is dead configuration and the
+tab bar is empty whichever mode is chosen. Port them together.
 
 `65efaf9` is a prerequisite for the three after it: until the asset policy was consulted from the
 catch-all, a discovered prefix had no route to reach the handler that reads the policy, so nothing
